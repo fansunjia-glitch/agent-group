@@ -217,8 +217,8 @@ class TopicManager:
             raise PermissionError("Only the administrator may publish to the administrator topic")
         self.communication.send(topic_id, payload)
         self._emit("message_sent", topic_id=topic_id,
-                   sender_id=self.communication.agent_id, payload=payload[:2000],
-                   truncated=len(payload) > 2000)
+                   sender_id=self.communication.agent_id, payload=payload,
+                   truncated=False)
 
     def leave_topic(self, topic_id: str) -> None:
         if topic_id in self._protected_topics:

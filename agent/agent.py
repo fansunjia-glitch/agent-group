@@ -237,8 +237,8 @@ class Agent:
                 for message in group["messages"]:
                     payload = message["payload"]
                     self._emit("message_received", topic_id=topic_id,
-                               sender_id=message["sender_id"], payload=payload[:2000],
-                               truncated=len(payload) > 2000)
+                               sender_id=message["sender_id"], payload=payload,
+                               truncated=False)
                 continue
             for message in group["messages"]:
                 if message["sender_id"] != self._admin_sender_id:
@@ -260,7 +260,7 @@ class Agent:
                     }})
                     self._emit("message_received", topic_id=topic_id,
                                sender_id=message["sender_id"], notice_id=notice_id,
-                               payload=notice["content"][:2000], truncated=len(notice["content"]) > 2000)
+                               payload=notice["content"], truncated=False)
         return result
 
     def stop(self) -> None:

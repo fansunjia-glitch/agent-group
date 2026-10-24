@@ -7,7 +7,7 @@ from pathlib import Path
 import secrets
 import signal
 from threading import Thread
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .service import ControlError, ControlService
 
@@ -53,13 +53,31 @@ def make_server(service, port=8765):
         def do_GET(self):
             try:
                 self.verify_origin()
-                path = urlsplit(self.path).path
+                parsed = urlsplit(self.path)
+                path = parsed.path
                 if path == "/api/state":
                     self.reply(200, service.snapshot())
+                    return
+                parts = path.strip("/").split("/")
+                if len(parts) == 4 and parts[:2] == ["api", "topics"] and parts[3] == "messages":
+                    query = parse_qs(parsed.query, keep_blank_values=True)
+                    if any(key not in ("before", "after", "limit", "q") or len(value) != 1 for key, value in query.items()):
+                        raise ControlError("Invalid history query parameters")
+                    def integer(key, default=None):
+                        if key not in query:
+                            return default
+                        raw = query[key][0]
+                        if not raw.isascii() or not raw.isdecimal() or len(raw) > 19:
+                            raise ControlError(f"{key} must be a non-negative integer")
+                        return int(raw)
+                    self.reply(200, service.topic_messages(unquote(parts[2]), before=integer("before"),
+                               after=integer("after"), limit=integer("limit", 50), query=query.get("q", [""])[0]))
                     return
                 assets = {"/": ("index.html", "text/html; charset=utf-8"),
                           "/index.html": ("index.html", "text/html; charset=utf-8"),
                           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+                          "/topology.js": ("topology.js", "text/javascript; charset=utf-8"),
+                          "/topology.css": ("topology.css", "text/css; charset=utf-8"),
                           "/styles.css": ("styles.css", "text/css; charset=utf-8")}
                 if path not in assets:
                     raise ControlError("Not found", 404)
@@ -97,6 +115,8 @@ def make_server(service, port=8765):
                     result = service.delete_profile(parts[2])
                 elif self.command == "DELETE" and len(parts) == 3 and parts[:2] == ["api", "topics"]:
                     result = service.delete_topic(parts[2])
+                elif self.command == "DELETE" and len(parts) == 3 and parts[:2] == ["api", "notices"]:
+                    result = service.delete_notice(parts[2])
                 elif self.command != "POST":
                     raise ControlError("Not found", 404)
                 elif parts == ["api", "credentials"]:

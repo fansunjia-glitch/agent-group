@@ -57,7 +57,8 @@ def main() -> None:
     finished = Event()
     try:
         # Console chunks may split a secret across writes. Suppress that raw
-        # stream entirely; bounded completed events and formatted logs remain.
+        # stream entirely; structured events and formatted logs remain. Chat
+        # message events carry the complete payload for durable topic history.
         with open(os.devnull, "w") as console, redirect_stdout(console), Agent(**config, event_sink=emit) as node:
             class RedactingFormatter(logging.Formatter):
                 def format(self, record):

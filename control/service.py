@@ -21,6 +21,7 @@ from uuid import uuid4
 from comm import Comm
 from agent.identity import profile_user_id, validate_user_id
 from .redact import redact
+from .history import TopicHistory
 
 
 class ControlError(Exception):
@@ -102,24 +103,29 @@ class ControlService:
             self.lease.close()
             raise
         self.topic = None
+        self.history = None
+        self.history_recovery = {}
         try:
+            self.history = TopicHistory(self.root / "history.sqlite3")
+            self.history.import_legacy(self.root, self.data["notices"])
+            from .history_recovery import recover_truncated_sends
+            recovered, self.history_recovery = recover_truncated_sends(
+                self.history.truncated_sent_events(), self.root / "workspaces")
+            for event in recovered:
+                self.history.append_event(redact(event, (self.api_key, self.admin_secret)))
             if self.data["admin_topic"]:
                 info = self.data["admin_topic"]
                 topic_id = self.comm.create_topic(info["name"], info["description"])
                 self.topic = {**info, "topic_id": topic_id}
+                self.history.remember_topics([self.topic])
             for profile in self.data["profiles"]:
                 self.runtime[profile["id"]] = self._empty_runtime()
-            event_path = self.root / "events.jsonl"
-            if event_path.exists():
-                with event_path.open() as stream:
-                    for line in deque(stream, maxlen=400):
-                        try:
-                            self.events.append(json.loads(line))
-                        except ValueError:
-                            pass
+            self.events.extend(self._event_preview(e) for e in self.history.recent_events())
             self._save()
         except BaseException:
             self.comm.close()
+            if self.history is not None:
+                self.history.close()
             self.lease.close()
             raise
         self.thread = None
@@ -337,6 +343,17 @@ class ControlService:
                 self.runtime[identifier]["error"] = "Control connection lost; shutdown is not confirmed"
             return deepcopy(self.runtime[identifier])
 
+    @staticmethod
+    def _event_preview(event):
+        # Dashboard polling stays bounded. Complete message bodies are retained
+        # in the durable archive and fetched by the paginated conversation API.
+        preview = deepcopy(event)
+        if isinstance(preview.get("payload"), str) and len(preview["payload"]) > 2000:
+            preview["payload"] = preview["payload"][:2000]
+            preview["truncated"] = True
+            preview["preview_truncated"] = True
+        return preview
+
     def _record_event(self, profile_id, run_id, event):
         # Protocol fields containing credentials are never retained or returned.
         event = {k: v for k, v in event.items() if k not in ("api_key", "secret", "signature", "reasoning_content")}
@@ -345,10 +362,11 @@ class ControlService:
             event["tool_name" if event.get("type", "").startswith("tool_") else "topic_name"] = event["name"]
         event.update(id=uuid4().hex, ts=timestamp(), profile_id=profile_id, run_id=run_id,
                      name=self._profile(profile_id)["name"] if profile_id else "管理员")
-        self.events.append(event)
+        self.history.append_event(event)
+        self.events.append(self._event_preview(event))
         path = self.root / "events.jsonl"
         if path.exists() and path.stat().st_size > 8_000_000:
-            os.replace(path, self.root / "events.previous.jsonl")
+            os.replace(path, self.root / f"events.{time.time_ns()}.{uuid4().hex[:8]}.jsonl")
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(event, ensure_ascii=False) + "\n")
 
@@ -415,8 +433,8 @@ class ControlService:
     def _read_worker(self, identifier, record):
         process = record["process"]
         try:
-            while raw := process.stdout.readline(1_048_577):
-                if len(raw) > 1_048_576:
+            while raw := process.stdout.readline(8 * 1_048_576 + 1):
+                if len(raw) > 8 * 1_048_576:
                     raise ValueError("Oversized worker event")
                 try:
                     event = json.loads(raw)
@@ -455,6 +473,7 @@ class ControlService:
             self.topic = {"topic_id": topic_id, "name": name, "description": description}
             self.data["admin_topic"] = {"name": name, "description": description}
             self._save()
+            self.history.remember_topics([self.topic])
         self.invite_all()
         return deepcopy(self.topic)
 
@@ -499,7 +518,7 @@ class ControlService:
                 raise ControlError("当前管理员通知频道用于全体通知，不能删除", 409)
             existing = next((t for t in self.data["deleted_topics"] if t["topic_id"] == identifier), None)
             if existing is None:
-                metadata = next((t for t in self.topic_cache if t["topic_id"] == identifier), None)
+                metadata = next((t for t in self.topic_cache if t["topic_id"] == identifier), None) or self.history.topic(identifier)
                 events = [e for e in self.events if e.get("topic_id") == identifier]
                 known_member = any(identifier in r["joined_topics"] for r in self.runtime.values())
                 if metadata is None and not events and not known_member:
@@ -557,7 +576,29 @@ class ControlService:
                       "publish_error": None, "receipts": {t["profile_id"]: {"status": "pending"} for t in targets}}
             self.data["notices"].append(notice)
             self._save()
+            self.history.add_notice(notice)
         return self.publish_notice(notice["id"])
+
+    def delete_notice(self, identifier):
+        """Remove the notification-center record, without retracting delivery.
+
+        Serialize with publishers so a captured retry cannot recreate or save
+        the removed record after this operation returns. Already delivered or
+        in-flight messages and archived topic history remain unchanged.
+        """
+        with self.publish_lock:
+            with self.lock:
+                previous = self.data["notices"]
+                if not any(notice["id"] == identifier for notice in previous):
+                    raise ControlError("Notice not found", 404)
+                self.data["notices"] = [notice for notice in previous if notice["id"] != identifier]
+                try:
+                    self._save()
+                except BaseException:
+                    self.data["notices"] = previous
+                    raise
+                self.last_attempt.pop(identifier, None)
+                return {"deleted": identifier, "history_retained": True}
 
     def publish_notice(self, identifier):
         from agent.admin import sign_notice
@@ -610,6 +651,7 @@ class ControlService:
                 topics = [asdict(t) for t in self.comm.discover_topics()]
                 with self.lock:
                     self.topic_cache = topics
+                    self.history.remember_topics(topics)
                 if self.topic:
                     self.comm.receive(self.topic["topic_id"])
             except Exception:
@@ -617,12 +659,28 @@ class ControlService:
                 # temporary peer discovery errors must not stop reconciliation.
                 continue
 
+    def topic_messages(self, identifier, *, before=None, after=None, limit=50, query=""):
+        with self.lock:
+            if any(t["topic_id"] == identifier for t in self.data["deleted_topics"]):
+                raise ControlError("Topic was deleted", 404)
+            known = self.history.topic(identifier) or next(
+                (t for t in self.topic_cache if t["topic_id"] == identifier), None)
+            if not known and not (self.topic and self.topic["topic_id"] == identifier):
+                raise ControlError("Topic not found", 404)
+            try:
+                return self.history.message_page(identifier, before=before, after=after, limit=limit, query=query)
+            except ValueError as exc:
+                raise ControlError(str(exc)) from None
+
     def snapshot(self):
         with self.lock:
             profiles = [{**p, "runtime": deepcopy(self.runtime[p["id"]])} for p in self.data["profiles"]]
-            topics = {t["topic_id"]: deepcopy(t) for t in self.topic_cache}
+            topics = {t["topic_id"]: t for t in self.history.topics()}
+            for topic in self.topic_cache:
+                previous = topics.get(topic["topic_id"], {})
+                topics[topic["topic_id"]] = {**previous, **deepcopy(topic), "is_historical": False}
             if self.topic:
-                topics[self.topic["topic_id"]] = deepcopy(self.topic)
+                topics[self.topic["topic_id"]] = {**topics.get(self.topic["topic_id"], {}), **deepcopy(self.topic), "is_historical": False}
             for p in profiles:
                 for identifier in p["runtime"]["joined_topics"]:
                     topics.setdefault(identifier, {"topic_id": identifier, "name": identifier[:12], "description": ""})
@@ -634,12 +692,16 @@ class ControlService:
                 topic["is_admin"] = bool(self.topic and self.topic["topic_id"] == topic["topic_id"])
                 topic["can_delete"] = not topic["is_admin"]
                 topic["delete_reason"] = "当前管理员通知频道用于全体通知，不能删除" if topic["is_admin"] else None
-                topic["members"] = [{"profile_id": p["id"], "name": p["name"]} for p in profiles
-                                    if topic["topic_id"] in p["runtime"]["joined_topics"] or
-                                    (topic["is_admin"] and p["runtime"]["admin_joined"])]
+                if not topic.get("is_historical"):
+                    topic["members"] = [{"profile_id": p["id"], "name": p["name"]} for p in profiles
+                                        if topic["topic_id"] in p["runtime"]["joined_topics"] or
+                                        (topic["is_admin"] and p["runtime"]["admin_joined"])]
+                if topic.get("last_message"):
+                    topic["last_message"]["content"] = topic["last_message"]["content"][:200]
             return {"csrf_token": self.csrf_token, "credentials_configured": bool(self.api_key),
                     "admin": {"agent_id": self.comm.agent_id, "endpoint": self.comm.endpoint, "topic": deepcopy(self.topic)},
                     "hosts": deepcopy(self.data["hosts"]), "profiles": profiles, "topics": list(topics.values()),
+                    "history_recovery": deepcopy(self.history_recovery),
                     "deleted_topic_ids": sorted(deleted),
                     "topic_deletions": [self._topic_deletion_state(t) for t in self.data["deleted_topics"]],
                     "notices": deepcopy(list(reversed(self.data["notices"]))), "events": deepcopy(list(self.events))}
@@ -663,6 +725,11 @@ class ControlService:
                 record["process"].terminate()
         if self.thread:
             self.thread.join(timeout=3)
+        # Drain completed worker output before closing its durable history sink.
+        for record in self.processes.values():
+            if reader := record.get("reader"):
+                reader.join(timeout=3)
         self.comm.close()
+        self.history.close()
         self.lease.close()
         self.api_key = ""
