@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Agent Group · 协作控制台</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#overview" aria-label="Agent Group 协作概览"><span class="brand-symbol">ag<span></span></span><span>Agent Group<small>协作控制台</small></span></a>
+      <div class="nav-label">工作区</div>
+      <nav aria-label="主导航">
+        <a href="#overview" data-page="overview"><span data-icon="network" aria-hidden="true"></span>协作概览</a>
+        <a href="#agents" data-page="agents"><span data-icon="agents" aria-hidden="true"></span>Agents <span class="nav-count" id="agent-count">—</span></a>
+        <a href="#topics" data-page="topics"><span data-icon="hash" aria-hidden="true"></span>Topics</a>
+        <a href="#trace" data-page="trace"><span data-icon="trace" aria-hidden="true"></span>执行事件</a>
+        <a href="#notices" data-page="notices"><span data-icon="radio" aria-hidden="true"></span>通知中心</a>
+      </nav>
+      <div class="nav-label nav-label-secondary">基础设施</div>
+      <nav aria-label="基础设施导航"><a href="#hosts" data-page="hosts"><span data-icon="server" aria-hidden="true"></span>运行主机</a></nav>
+      <div class="sidebar-bottom"><span class="workspace-symbol">W</span><div>本地控制面<small id="admin-endpoint">等待连接</small></div></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="breadcrumb" id="breadcrumb">工作区 / 协作概览</div>
+        <div class="topbar-actions"><span class="connection" id="connection-status"><span class="status-dot"></span>正在连接</span><button type="button" class="button secondary compact" id="credentials-button" data-action="credentials"><span data-icon="key" aria-hidden="true"></span><span id="credentials-label">设置 API 凭据</span></button><button type="button" class="button primary compact" data-action="new-notice"><span data-icon="radio" aria-hidden="true"></span>全体通知</button></div>
+      </header>
+      <div id="connection-banner" class="connection-banner" role="status" hidden></div>
+      <main id="main" aria-label="工作区内容">
+        <div class="page-heading"><div><div class="eyebrow">AGENT WORKSPACE</div><h1 id="page-title">协作概览</h1><p id="page-description">查看各个 Agent 的当前状态与 Topic 协作关系。</p></div><div id="page-actions" class="page-actions"></div></div>
+        <div id="page-content"><div class="empty-state"><span class="loading-dot"></span><h2>正在连接控制服务</h2><p>读取 Agent、Topic 与运行主机状态。</p></div></div>
+      </main>
+      <footer class="footer"><span id="footer-summary">等待状态</span><span>来自控制服务的真实状态<span class="footer-separator">·</span><span id="last-updated">尚未更新</span></span></footer>
+    </div>
+  </div>
+  <dialog id="editor-dialog" aria-labelledby="dialog-title"><div class="dialog-header"><div><span id="dialog-kicker" class="eyebrow">WORKSPACE</span><h2 id="dialog-title"></h2></div><button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭对话框"><span data-icon="close" aria-hidden="true"></span></button></div><div id="dialog-content"></div></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <div id="announcer" class="sr-only" aria-live="polite"></div>
+</body>
+</html>

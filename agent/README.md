@@ -1,150 +1,121 @@
-# Agent Harness
+# 独立 Agent 节点
 
-常驻运行的多 agent harness，模型与工具循环参考 Learn Claude Code。每个 agent 在独立进程中运行，根据初始提示词自主工作，通过 topic 消息和定时任务接收后续工作，不读取终端用户输入。
+每次启动运行一个进程、一个 `Agent` 和一个 `Comm`。节点通过已有的去中心化 topic 通信协作，同机使用共享内存，远程使用 HTTP；无需配置 agent 名单或启动屏障。
 
-## 安装与配置
+运行环境：Python 3.14+、macOS/Linux。依赖统一在仓库根目录 `pyproject.toml`，`uv.lock` 固定本次验证的版本。
 
-运行真实通信后端要求 **Python 3.14+、macOS/Linux**，与仓库的 `comm` 组件一致。Windows 原生运行暂不支持；Windows 可以检查配置，实际运行须使用符合条件的 Linux / macOS 环境。
+## 安装和启动
 
-从仓库根目录安装并准备配置：
+在仓库根目录运行：
 
 ```sh
-cd agent
-python3.14 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-# 已有 .env 时请保留原文件和密钥。
-[ -f .env ] || cp .env.example .env
+uv sync
 ```
 
-编辑 `.env`。所有配置均由这个文件加载，`.env.example` 提供完整的三个 agent 示例。
+编辑根目录 `launch_agent.py` 的 `API_KEY`，按需调整 `BASE_URL`、`MODEL` 和 `INITIAL_PROMPT`，然后直接启动：
 
-### 公共模型设置
-
-```dotenv
-ANTHROPIC_API_KEY=填写你的模型服务密钥
-ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
-MODEL_ID=填写该服务实际可用的模型名称
+```sh
+uv run python launch_agent.py
 ```
 
-模型请求使用 Anthropic SDK。使用 DeepSeek 时填写其 Anthropic 兼容接口地址和 DeepSeek API key，变量名仍保留 `ANTHROPIC_` 前缀。同一组 agent 共用这些模型设置，进程之间各自维护上下文。不要将真实 `.env` 提交到 Git。
+配置通过 Python 参数传入。启动器和 agent 都不加载 `.env`，也不从环境变量读取模型或节点配置。模型客户端和 Comm 由 `Agent` 内部创建和关闭。
 
-### 单个 agent
+默认模型参数：
 
-```dotenv
-AGENTS=worker
-TOPICS=tasks,results
-COMM_HOST=127.0.0.1
-
-AGENT_WORKER_WORKDIR=./workspaces/worker
-AGENT_WORKER_TOPICS=tasks,results
-AGENT_WORKER_INITIAL_PROMPT="你是任务执行 agent。
-启动后等待 tasks 中的消息，完成任务后将结果作为字符串发送到 results。
-需要文件操作时只使用自己的工作目录，当前任务完成后等待后续消息。"
-```
-
-### 多个 agent
-
-将 `AGENTS` 改为逗号分隔的名称，并为每个名称提供配置：
-
-```dotenv
-AGENTS=worker,reviewer
-TOPICS=tasks,drafts,results
-COMM_HOST=127.0.0.1
-
-AGENT_WORKER_WORKDIR=./workspaces/worker
-AGENT_WORKER_TOPICS=tasks,drafts,results
-AGENT_WORKER_INITIAL_PROMPT="处理 tasks 中的任务，将待复核结果发送到 drafts。"
-
-AGENT_REVIEWER_WORKDIR=./workspaces/reviewer
-AGENT_REVIEWER_TOPICS=drafts,results
-AGENT_REVIEWER_INITIAL_PROMPT="复核 drafts 中的结果，将结论发送到 results。"
-```
-
-配置规则：
-
-| 配置 | 说明 |
+| 参数 | 默认值 |
 | --- | --- |
-| `AGENTS` | 要启动的 agent 名称，至少一个；每个名称对应一个独立进程 |
-| `AGENT_<名称>_WORKDIR` | 必填，工具和运行数据使用的工作目录，各 agent 必须不同 |
-| `AGENT_<名称>_INITIAL_PROMPT` | 必填，初始系统提示词；双引号内支持多行 |
-| `AGENT_<名称>_TOPICS` | 可选，启动时订阅的 topic 名称；留空表示暂不订阅 |
-| `TOPICS` | 启动时预建或加入的 topic 名称，须包含配置中引用的订阅名称 |
-| `COMM_HOST` | 可选，本机网卡 IPv4；留空自动选择并启用局域网发现，`127.0.0.1` 仅同机通信 |
-| `COMM_SEEDS` | 可选，逗号分隔的已有节点 HTTP 地址；正常同机／局域网发现无需填写 |
-| `COMM_TIMEOUT` | 可选，通信请求超时秒数，默认 `5`，必须为有限正数 |
-| `AGENT_STARTUP_TIMEOUT` | 可选，等待同组全部 agent 订阅完成的超时秒数，默认 `60` |
+| `base_url` | `https://api.deepseek.com` |
+| `model` | `deepseek-flash` |
+| `thinking` | `False`，显式关闭思考模式 |
+| `request_timeout` | `30.0` 秒；SDK 自动重试关闭 |
+| `max_tokens` | `8000` |
 
-名称以英文字母开头，后续可使用字母、数字、下划线和连字符。环境变量前缀使用大写，连字符转为下划线，例如 `review-agent` 对应 `AGENT_REVIEW_AGENT_`。转换后的前缀不得重复。
+使用 OpenAI SDK 的 `chat.completions.create()` 协议，包括流式文本、函数工具调用和工具结果回传。模型名称与地址依据 [DeepSeek 官方接口说明](https://api-docs.deepseek.com/)；工具和思考字段遵循 [工具调用](https://api-docs.deepseek.com/guides/tool_calls/) 与 [思考模式](https://api-docs.deepseek.com/guides/thinking_mode/) 文档。`thinking=True` 时会保存并回传 `reasoning_content`，不把它打印为回答。
 
-配置中的相对路径以 `.env` 所在目录为基准；Windows 路径建议使用 `/`。启动器会创建工作目录，设置各进程的 `AGENT_NAME`、`AGENT_WORKDIR` 和当前目录，再加载 agent 模块。不需要配置公共 `AGENT_WORKDIR`。
+每次启动默认生成新的名称和独立 `workspaces/<name>/` 工作目录。多开进程即可运行多个节点。显式设置 `WORKDIR` 为已有目录时恢复其历史、记忆和定时任务；并行运行的节点必须使用不同目录。
 
-## 启动
+## 在代码中使用
 
-先检查配置，再启动：
+```python
+from agent import Agent
 
-```sh
-python launch_agents.py --check
-python launch_agents.py
+with Agent(
+    api_key="填写 DeepSeek API key",
+    base_url="https://api.deepseek.com",
+    model="deepseek-flash",
+    initial_prompt="发现任务讨论 topic，根据名称和描述决定加入，协作完成任务。",
+    name="worker",
+    workdir="./workspaces/worker",
+) as agent:
+    agent.run()
 ```
 
-`--check` 不调用模型、不启动 agent，不显示密钥或完整提示词。实际启动前必须填入有效的 API key。
+`run()` 在当前进程中运行，完成启动任务后进入等待；topic 消息或到期任务会唤醒它。`stop()` 请求退出，`close()` 幂等清理资源，`run()` 的退出路径也会自动清理。可读取 `agent_id`、`endpoint`、`name`、`workdir` 和 `state`。
 
-只启动名单中的一个 agent：
+其他可选参数：`host=None`、`seeds=()` 传给 Comm；`enable_memory=True` 控制长期记忆；`idle_interval=0.2` 控制等待期间的检查间隔；`max_context_chars=60000` 控制模型请求的近似输入预算。
 
-```sh
-python launch_agents.py --agent worker
-```
+启动器处理 SIGINT/Ctrl+C 和 SIGTERM，仅设置停止标记。模型流的每个分片、每次模型请求以及工具之间都会检查停止状态。正在阻塞的同步请求仍需返回或超时，正在运行的同步工具允许完成；停止后不开始下一次工具或模型调用，也不通过强杀子进程退出。
 
-使用另一份配置文件：
+## 处理流程
 
-```sh
-python launch_agents.py --env /path/to/team.env --check
-python launch_agents.py --env /path/to/team.env
-```
+1. 恢复本节点历史与定时任务，加入启动提示。
+2. 收集已加入 topic 的消息及到期任务，按需要召回记忆。
+3. 构造受预算约束的请求，接收流式回答及分片工具参数。
+4. 完整生成后执行工具，以 OpenAI `role=tool` 消息回传结果，再继续调用模型。
+5. 没有工具调用时完成当前工作，提取长期记忆并进入等待。
 
-不带 `--agent` 时启动 `AGENTS` 中的全部 agent，每个 agent 一个子进程、一个独立 `Comm` 实例，另有一个启动器进程。只配置 `AGENTS=worker` 时也使用相同启动流程。Ctrl+C 请求这一组进程停止。启动器发现子进程退出时也会停止同组其他进程，故障退出码会返回到终端。
+模型通过 `discover_topics` 获取 `topic_id`、`name`、`description`，自行决定加入或创建 topic。启动器不预建 topic、不以名称代替 topic ID。接收器保持 `sender_id` 与原始字符串 `payload`，不解析 payload 内部字段。
 
-也可在仓库根目录运行 `python agent/launch_agents.py` 或 `python -m agent.launch_agents`，默认仍读取 `agent/.env`。
+生成期间如果收到 topic 消息，会关闭当前流，保存已有文本并标记为未完成回复；未完成的工具调用不会执行。思考和工具参数分片期间也会检查新消息。工具执行期间的新消息在下一次模型请求前收集。
 
-启动后 agent 根据初始提示词开始首次工作；调用模型、执行工具并继续处理工具结果，直到当前任务完成。没有新消息和到期任务时进入等待，每 0.2 秒检查一次待处理事件，不调用模型。收到 topic 消息或到期任务后恢复工作。
+## Web 控制台
 
-后续指令须通过通信接口的 `send(topic_id, payload)` 发送，`payload` 为字符串。agent 不从终端读取指令；配置中的初始订阅从加入时的末尾开始，启动前发送的历史消息不会自动补发。
+在仓库根目录运行 `uv run python launch_control.py`，打开 `http://127.0.0.1:8765`。
+控制台支持人设配置、本机与局域网 SSH 启停、Topic 拓扑、运行事件，以及带回执和离线补收的管理员通知。
+模型 API key 在页面中设置，仅保存在本次服务内存。配置和独立工作目录保存在 `.control/`。
+详细要求与操作步骤见 [控制台说明](../control/README.md)。
 
-## 通信与工具
+## 文件职责
 
-启动器通过 `communication.py` 直接创建仓库的 `comm.Comm`，没有 SQLite 或模拟通信后备。请将本目录与 `comm/` 保持为仓库中的同级目录。
-
-启动时，启动器临时创建一个 `Comm` 节点，发现并加入已有的配置 topic，或在不存在时创建。它把 topic ID 和临时 seed 地址写入本次运行的 `topics.json`，各子进程据此加入同一组 topic。所有子进程确认订阅完成后，启动器关闭临时节点并放行模型调用；后续消息在 agent 之间直接传递，不经过启动器。如果订阅未在配置时间内完成，该组进程停止，错误写入日志。
-
-名称用于启动配置，实际通信使用唯一 topic ID。发现到同名的多个 topic 时，启动器报错，避免随意选择不同频道。跨机器加入已有团队时先启动一台，再启动其他机器，让它们发现已有 topic；同时各自创建同名 topic 不会自动合并。没有任何成员订阅的 topic 会消失；只预建但无人订阅的 topic 在临时节点关闭后也会消失。
-
-每个 `Comm` 自动生成唯一 `sender_id`，与 `.env` 中的 agent 名称分别管理，避免不同机器使用相同配置时 ID 冲突。名称、`sender_id` 和 HTTP endpoint 的对应关系写入各 agent 日志和本次运行的 `ready/<名称>.json`。收件保留 `sender_id` 及原始字符串 `payload`，不解析或改写 payload。
-
-同机默认优先通过共享内存投递，跨机器由 `comm` 使用点对点 HTTP，自动发现使用局域网 UDP 组播。需要指定网卡时设置 `COMM_HOST` 为该机器的实际 IPv4；它不是其他 agent 的地址。受限网络可配置一个已有节点的 `COMM_SEEDS`。具体传输和资源容量说明见 [comm 文档](../comm/README.md)。通信组件不提供消息持久化或异常进程退出后的共享内存资源回收。
-
-`TopicManager` 对接六方法通信接口：`create_topic`、`discover_topics`、`join_topic`、`send`、`receive`、`leave_topic`。`TopicInfo` 与 `Message` 数据类转换为模型上下文可使用的 JSON 对象。其中 `receive` 由 harness 在模型调用前、文本流每个片段输出后和等待状态下读取；其余五个方法作为模型工具提供。发送只给其他已加入成员，不会回送给自己。
-
-文件工具包括 `read_file(path, limit=None)`、`write_file(path, content)`、`edit_file(path, old_text, new_text)` 和 `glob(pattern)`。`edit_file` 只替换第一次精确匹配，`glob` 支持 `**/*.py` 等模式。
-
-文件工具统一限制在该 agent 的工作目录内，检查解析后的真实路径，并拒绝越界访问、外部链接、硬链接文件及 Windows 设备路径和数据流。glob 不遍历符号链接和 junction。当前不提供 Bash 或任意代码执行工具，目录限制属于工具层约束。
-
-定时工具为 `schedule_cron`、`list_crons` 和 `cancel_cron`。cron 使用北京时间（UTC+8）的五段表达式，例如 `0 9 * * *` 表示每天 09:00。到期 prompt 进入消息队列唤醒 agent；定时线程本身不调用模型。
-
-## 运行数据与恢复
-
-每个工作目录分别保存：
-
-| 路径 | 内容 |
+| 文件 | 职责 |
 | --- | --- |
-| `.logs/agent.log` | 状态切换、工具调用和运行错误 |
-| `.logs/console.log` | 启动器收集的模型流式输出及标准错误 |
-| `.logs/history.json` | 当前对话上下文，启动时自动恢复 |
-| `.memory/` | 长期记忆和索引 |
-| `.scheduled_tasks.json` | 持久化的定时任务及待交付状态 |
+| `../launch_agent.py` | 显式启动参数、单节点入口、退出信号 |
+| `agent.py` | `Agent` 生命周期、OpenAI 工具循环与资源清理 |
+| `topic_tools.py` | 把 Comm 接口暴露为模型工具，读取订阅消息 |
+| `file_tools.py` | 工作目录内的读、写、编辑及 glob |
+| `history.py` | `HistoryStore`、旧格式转换、请求上下文预算 |
+| `memory.py` | 每个节点独立的 `MemoryStore` |
+| `cron_scheduler.py` | 每个节点独立的 `CronScheduler` |
+| `test/` | 不调用真实模型的回归测试 |
 
-启动器日志保存于 `.env` 所在目录的 `.logs/launcher/<运行编号>/launcher.log`。
+模块导入不会创建模型客户端、Comm 服务或工作目录。状态都归具体实例所有，工作目录在构造时固定，不依赖修改进程当前目录。
 
-流式生成期间到达的新 topic 消息会关闭当前流，保留已经输出的部分文本，并在下一条消息中注明中断后重新调用模型。被中断响应中的工具调用不执行。工具执行期间不会中断工具，消息在后续模型调用前注入。
+## 历史、记忆和定时任务
 
-历史和持久化定时任务默认恢复；长期记忆在工作阶段召回，并在任务完成后按需提取。记忆处理可能额外调用模型。不要将工作目录、日志、历史、记忆或通信数据库提交到 Git。
+历史保存在 `.logs/history.json`，日志保存在 `.logs/agent.log`，长期记忆保存在 `.memory/`，定时任务保存在 `.scheduled_tasks.json`。这些目录和默认工作目录已加入 Git 忽略规则。
+
+历史完整保存到磁盘，模型请求只取预算内的最近完整轮次。预算包括 system、召回记忆、工具定义和对话消息；它按序列化字符数计算，并非精确 token 计数，须按所选模型留出输出空间。工具调用及对应结果不会被拆开；尚未处理的连续消息、被中断的当前轮也不能互相裁剪。最新一轮本身超出预算时明确报错，保留历史供调整预算后恢复。
+
+原先 Anthropic 文本、`tool_use`、`tool_result` 格式的历史会转换为 OpenAI 格式；不支持的非文本内容或缺失工具结果会明确报错，避免静默丢数据。正常停止或 KeyboardInterrupt 会为未完成工具补充明确的取消/中断结果。
+
+长期记忆支持召回、提取和整理，同名或同描述的更正会更新现有记录。辅助记忆请求统一关闭 thinking；`enable_memory=False` 可禁用这些辅助请求而保留对话历史。
+
+定时任务支持五字段 cron，时区固定 UTC+8，支持 `*`、数字、范围、列表和 `*/n`，不支持 `a-b/n`。日/月步进从 1 开始，例如 `0 9 */2 * *` 对应 1、3、5……日的 09:00。调度线程只排队，不调用模型。一次性任务在提示送入模型并获得完整响应后确认删除。
+
+## 测试
+
+在根目录运行全部 agent 和 comm 测试：
+
+```sh
+uv run python -m unittest discover -v
+```
+
+真实组播测试默认跳过，需要本机有局域网 IPv4 路由并允许组播：
+
+```sh
+COMM_TEST_LAN=1 uv run python -m unittest discover -v
+```
+
+Agent 测试使用模拟模型或本机 HTTP/SSE 服务，不需要真实 API key，也不访问 DeepSeek。保留了两个真实 Comm 节点的消息测试。没有做 200/1024 节点规模验证。
+
+本次本地验证使用系统 CPython 3.14.0。若组播测试在某个解释器中没有响应，可以先用系统 Python 单独运行同一测试进行对照；本机曾出现系统 Python 可用、uv 管理的 Python 3.14.3 不可用的差异。可用 `uv sync --python /path/to/python3.14` 指定已经验证可用的解释器，组播测试仍以真实收发结果为准。

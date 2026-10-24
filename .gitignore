@@ -55,8 +55,14 @@ coverage.xml
 
 # Framework and tool output
 *.log
+.logs/
+.memory/
+.scheduled_tasks.json
+.agent-user-id
+workspaces/
 db.sqlite3
 db.sqlite3-journal
+.control/
 .scrapy/
 .cache/
 

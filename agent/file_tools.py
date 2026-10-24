@@ -129,17 +129,93 @@ class FileTools:
 
 
 TOOLS = [
-    {"name": "read_file", "description": "Read a UTF-8 file inside your workspace; limit is a line count.",
-     "input_schema": {"type": "object", "properties": {
-         "path": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write a UTF-8 file inside your workspace, creating parent directories.",
-     "input_schema": {"type": "object", "properties": {
-         "path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace the first exact occurrence of old_text in a workspace file.",
-     "input_schema": {"type": "object", "properties": {
-         "path": {"type": "string"}, "old_text": {"type": "string", "minLength": 1},
-         "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find workspace files by relative pattern, e.g. **/*.py. Returns up to 200 paths; skips links.",
-     "input_schema": {"type": "object", "properties": {
-         "pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a UTF-8 file inside your workspace; limit is a line count.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1
+                    }
+                },
+                "required": [
+                    "path"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write a UTF-8 file inside your workspace, creating parent directories.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string"
+                    },
+                    "content": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "path",
+                    "content"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace the first exact occurrence of old_text in a workspace file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string"
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "new_text": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "path",
+                    "old_text",
+                    "new_text"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find workspace files by relative pattern, e.g. **/*.py. Returns up to 200 paths; skips links.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "pattern"
+                ]
+            }
+        }
+    }
 ]

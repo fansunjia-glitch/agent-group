@@ -3,4 +3,7 @@ name = "agent-group"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "openai>=1.40.0",
+    "PyYAML>=6.0",
+]

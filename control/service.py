@@ -1,0 +1,668 @@
+"""Durable profiles, process supervision, and administrator-topic broadcasts."""
+
+from collections import deque
+from copy import deepcopy
+from dataclasses import asdict
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+from threading import Event, Lock, RLock, Thread
+import time
+from urllib.parse import urlsplit
+from uuid import uuid4
+
+from comm import Comm
+from agent.identity import profile_user_id, validate_user_id
+from .redact import redact
+
+
+class ControlError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def timestamp():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def required_text(data, key, default=None, limit=1000):
+    value = data.get(key, default)
+    if not isinstance(value, str) or not value.strip() or len(value) > limit:
+        raise ControlError(f"{key} must be non-empty text (maximum {limit} characters)")
+    return value.strip()
+
+
+def ssh_command(host, *, probe=False):
+    """One shell boundary, with every remote argument POSIX-quoted."""
+    remote = "cd " + shlex.quote(host["repo_path"]) + " && exec " + shlex.quote(host["python_path"])
+    remote += " -u -m control.worker" + (" --probe" if probe else "")
+    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+            "-p", str(host["port"]), host["ssh_target"], remote]
+
+
+class ControlService:
+    def __init__(self, data_dir, *, comm_host=None, background=True):
+        self.root = Path(data_dir).expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.repo = Path(__file__).resolve().parents[1]
+        self.lock = RLock()
+        self.publish_lock = Lock()
+        self.closed = Event()
+        self.path = self.root / "control.json"
+        self.lease = (self.root / ".server.lock").open("a")
+        try:
+            fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.lease.close()
+            raise ControlError("This data directory is already managed by another control server", 409) from None
+        self.api_key = ""
+        self.csrf_token = secrets.token_urlsafe(32)
+        self.admin_secret = secrets.token_urlsafe(48)
+        self.processes = {}
+        self.runtime = {}
+        self.events = deque(maxlen=400)
+        self.topic_cache = []
+        self.last_attempt = {}
+        self.last_invite = {}
+        self.last_delete_attempt = {}
+        self.data = {"version": 1, "profiles": [], "hosts": [], "notices": [], "admin_topic": None,
+                     "deleted_topics": []}
+        try:
+            if self.path.exists():
+                loaded = json.loads(self.path.read_text())
+                if loaded.get("version") != 1:
+                    raise ControlError("Unsupported control data version")
+                self.data.update(loaded)
+            identities = set()
+            for profile in self.data["profiles"]:
+                user_id = validate_user_id(profile.get("user_id", profile_user_id(profile["id"])))
+                if user_id in identities:
+                    raise ControlError("Agent profiles must have distinct user_id values")
+                identities.add(user_id)
+                profile["user_id"] = user_id
+        except BaseException:
+            self.lease.close()
+            raise
+        if not any(host["id"] == "local" for host in self.data["hosts"]):
+            self.data["hosts"].insert(0, {"id": "local", "name": "本机", "kind": "local"})
+        self.comm_host = comm_host
+        try:
+            self.comm = Comm(host=comm_host, timeout=1.0)
+        except BaseException:
+            self.lease.close()
+            raise
+        self.topic = None
+        try:
+            if self.data["admin_topic"]:
+                info = self.data["admin_topic"]
+                topic_id = self.comm.create_topic(info["name"], info["description"])
+                self.topic = {**info, "topic_id": topic_id}
+            for profile in self.data["profiles"]:
+                self.runtime[profile["id"]] = self._empty_runtime()
+            event_path = self.root / "events.jsonl"
+            if event_path.exists():
+                with event_path.open() as stream:
+                    for line in deque(stream, maxlen=400):
+                        try:
+                            self.events.append(json.loads(line))
+                        except ValueError:
+                            pass
+            self._save()
+        except BaseException:
+            self.comm.close()
+            self.lease.close()
+            raise
+        self.thread = None
+        if background:
+            self.thread = Thread(target=self._maintain, name="control-reconcile", daemon=True)
+            self.thread.start()
+
+    @staticmethod
+    def _empty_runtime():
+        return {"state": "stopped", "pid": None, "agent_id": None, "endpoint": None,
+                "run_id": None, "admin_joined": False, "joined_topics": [], "error": None,
+                "last_seen": None}
+
+    def _save(self):
+        # Caller holds self.lock once concurrent request handling begins.
+        temporary = self.path.with_suffix(".tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(self.data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, self.path)
+
+    def _profile(self, identifier):
+        found = next((p for p in self.data["profiles"] if p["id"] == identifier), None)
+        if found is None:
+            raise ControlError("Agent profile not found", 404)
+        return found
+
+    def _host(self, identifier):
+        found = next((h for h in self.data["hosts"] if h["id"] == identifier), None)
+        if found is None:
+            raise ControlError("Host not found", 404)
+        return found
+
+    def set_credentials(self, data):
+        key = required_text(data, "api_key", limit=4096)
+        with self.lock:
+            self.api_key = key
+        return {"credentials_configured": True}
+
+    def save_profile(self, data, identifier=None):
+        if not isinstance(data, dict):
+            raise ControlError("Profile must be an object")
+        with self.lock:
+            if identifier:
+                self._profile(identifier)
+                proc = self.processes.get(identifier)
+                if proc and proc["process"].poll() is None:
+                    raise ControlError("Stop the agent before editing its profile", 409)
+            name = required_text(data, "name", limit=80)
+            if name in (".", "..") or any(c in name for c in ("/", "\\", "\x00")):
+                raise ControlError("Invalid agent name")
+            if any(p["name"] == name and p["id"] != identifier for p in self.data["profiles"]):
+                raise ControlError("Agent name already exists", 409)
+            persona = required_text(data, "persona", limit=16000)
+            initial = required_text(data, "initial_prompt", "完成当前任务后等待 topic 消息。", limit=16000)
+            base_url = required_text(data, "base_url", "https://api.deepseek.com", limit=2048)
+            url = urlsplit(base_url)
+            if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
+                raise ControlError("base_url must be an HTTP(S) URL without embedded credentials")
+            host_id = required_text(data, "host_id", "local")
+            self._host(host_id)
+            for key in ("enable_memory", "thinking"):
+                if key in data and type(data[key]) is not bool:
+                    raise ControlError(f"{key} must be a boolean")
+            profile_id = identifier or uuid4().hex
+            previous = self._profile(identifier) if identifier else None
+            user_id = previous.get("user_id", profile_user_id(profile_id)) if previous else profile_user_id(profile_id)
+            if "user_id" in data and data["user_id"] != user_id:
+                raise ControlError("user_id is generated by the platform and cannot be changed")
+            profile = {"id": profile_id, "user_id": user_id, "name": name, "persona": persona,
+                       "initial_prompt": initial, "base_url": base_url,
+                       "model": required_text(data, "model", "deepseek-flash", limit=150),
+                       "host_id": host_id, "enable_memory": data.get("enable_memory", False),
+                       "thinking": data.get("thinking", False)}
+            if identifier:
+                self.data["profiles"] = [profile if p["id"] == identifier else p for p in self.data["profiles"]]
+            else:
+                self.data["profiles"].append(profile)
+                self.runtime[profile["id"]] = self._empty_runtime()
+            self._save()
+            return deepcopy(profile)
+
+    def delete_profile(self, identifier):
+        with self.lock:
+            self._profile(identifier)
+            record = self.processes.get(identifier)
+            if record and record["process"].poll() is None:
+                raise ControlError("Stop the agent before deleting its profile", 409)
+            # Keep independent workspaces, trace events and frozen notification
+            # targets intact. Removing a profile must not rewrite past receipts.
+            self._record_event(identifier, self.runtime[identifier]["run_id"],
+                               {"type": "profile_deleted", "summary": "Agent profile deleted; history retained"})
+            self.data["profiles"] = [p for p in self.data["profiles"] if p["id"] != identifier]
+            self.runtime.pop(identifier, None)
+            self.processes.pop(identifier, None)
+            self.last_invite.pop(identifier, None)
+            self._save()
+            return {"deleted": identifier}
+
+    def add_host(self, data):
+        if data.get("kind", "ssh") != "ssh":
+            raise ControlError("The built-in local host already exists")
+        target = required_text(data, "ssh_target", limit=255)
+        if target.startswith("-") or not re.fullmatch(r"[a-zA-Z0-9_@.\-:\[\]]+", target):
+            raise ControlError("Use an SSH host alias or user@hostname, without command options")
+        repo = required_text(data, "repo_path", limit=2048)
+        workspace = required_text(data, "workspace_root", limit=2048)
+        if not PurePosixPath(repo).is_absolute() or not PurePosixPath(workspace).is_absolute():
+            raise ControlError("Remote repository and workspace paths must be absolute")
+        port = data.get("port", 22)
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ControlError("SSH port must be an integer from 1 to 65535")
+        python = required_text(data, "python_path", "python3", limit=2048)
+        if "\x00" in repo + workspace + python:
+            raise ControlError("Invalid remote path")
+        host = {"id": uuid4().hex, "name": required_text(data, "name", limit=100), "kind": "ssh",
+                "ssh_target": target, "port": port, "repo_path": repo, "python_path": python,
+                "workspace_root": workspace, "comm_host": data.get("comm_host") or None}
+        if host["comm_host"] is not None and not isinstance(host["comm_host"], str):
+            raise ControlError("comm_host must be a string")
+        with self.lock:
+            self.data["hosts"].append(host)
+            self._save()
+        return deepcopy(host)
+
+    def check_host(self, identifier):
+        with self.lock:
+            host = deepcopy(self._host(identifier))
+        command = ([sys.executable, "-m", "control.worker", "--probe"]
+                   if host["kind"] == "local" else ssh_command(host, probe=True))
+        try:
+            result = subprocess.run(command, cwd=self.repo, text=True, capture_output=True, timeout=15)
+            payload = json.loads(result.stdout.strip().splitlines()[-1]) if result.stdout.strip() else {}
+            if not isinstance(payload, dict):
+                payload = {}
+            ok = result.returncode == 0 and payload.get("protocol") == 2
+            error = None if ok else (result.stderr[-1500:] or "Worker protocol mismatch; update the remote checkout")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            ok, error, payload = False, str(exc), {}
+        check = {"ok": ok, "checked_at": timestamp(), "python": payload.get("python"), "error": error}
+        with self.lock:
+            self._host(identifier)["last_check"] = check
+            self._save()
+        return check
+
+    def _write_command(self, record, command):
+        with record["write_lock"]:
+            record["process"].stdin.write(json.dumps(command, ensure_ascii=False) + "\n")
+            record["process"].stdin.flush()
+
+    def start_profile(self, identifier):
+        with self.lock:
+            if self.closed.is_set():
+                raise ControlError("Control service is shutting down", 409)
+            profile = deepcopy(self._profile(identifier))
+            existing = self.processes.get(identifier)
+            if existing and existing["process"].poll() is None:
+                raise ControlError("Agent is already running or stopping", 409)
+            if not self.api_key:
+                raise ControlError("Set the session API key before starting agents", 409)
+            host = deepcopy(self._host(profile["host_id"]))
+            run_id = uuid4().hex
+            workdir = (str(self.root / "workspaces" / identifier) if host["kind"] == "local"
+                       else str(PurePosixPath(host["workspace_root"]) / identifier))
+            config = {key: profile[key] for key in ("name", "persona", "initial_prompt", "model",
+                                                     "base_url", "thinking", "enable_memory", "user_id")}
+            config.update(api_key=self.api_key, profile_id=identifier, workdir=workdir,
+                          host=self.comm_host if host["kind"] == "local" else host.get("comm_host"),
+                          seeds=[self.comm.endpoint],
+                          deleted_topic_ids=[t["topic_id"] for t in self.data["deleted_topics"]])
+            command = ([sys.executable, "-u", "-m", "control.worker"] if host["kind"] == "local"
+                       else ssh_command(host))
+            logs = self.root / "logs"
+            logs.mkdir(exist_ok=True, mode=0o700)
+            log = open(logs / f"{identifier}-{run_id}.log", "a", encoding="utf-8")
+            try:
+                process = subprocess.Popen(command, cwd=self.repo, stdin=subprocess.PIPE,
+                                           stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1)
+            except OSError as exc:
+                log.close()
+                raise ControlError(f"Could not start worker: {exc}", 502) from exc
+            record = {"process": process, "write_lock": Lock(), "run_id": run_id, "log": log,
+                      "host_kind": host["kind"], "worker_exit": False,
+                      "deleted_topic_ids": set(), "topic_delete_errors": {}}
+            self.processes[identifier] = record
+            self.runtime[identifier] = {**self._empty_runtime(), "state": "starting",
+                                        "run_id": run_id, "pid": process.pid if host["kind"] == "local" else None,
+                                        "control_pid": process.pid}
+            try:
+                self._write_command(record, {"type": "start", "config": config})
+            except (OSError, ValueError) as exc:
+                process.terminate()
+                process.wait(timeout=5)
+                log.close()
+                self.runtime[identifier].update(state="failed", error="Worker input closed before startup")
+                raise ControlError("Worker input closed before startup", 502) from exc
+            thread = Thread(target=self._read_worker, args=(identifier, record), daemon=True,
+                            name=f"control-worker-{identifier[:8]}")
+            record["reader"] = thread
+            thread.start()
+            return deepcopy(self.runtime[identifier])
+
+    def stop_profile(self, identifier):
+        with self.lock:
+            self._profile(identifier)
+            record = self.processes.get(identifier)
+            if not record or record["process"].poll() is not None:
+                return deepcopy(self.runtime[identifier])
+            self.runtime[identifier]["state"] = "stopping"
+            try:
+                self._write_command(record, {"type": "stop"})
+            except (OSError, ValueError):
+                self.runtime[identifier]["error"] = "Control connection lost; shutdown is not confirmed"
+            return deepcopy(self.runtime[identifier])
+
+    def _record_event(self, profile_id, run_id, event):
+        # Protocol fields containing credentials are never retained or returned.
+        event = {k: v for k, v in event.items() if k not in ("api_key", "secret", "signature", "reasoning_content")}
+        event = redact(event, (self.api_key, self.admin_secret))
+        if "name" in event:
+            event["tool_name" if event.get("type", "").startswith("tool_") else "topic_name"] = event["name"]
+        event.update(id=uuid4().hex, ts=timestamp(), profile_id=profile_id, run_id=run_id,
+                     name=self._profile(profile_id)["name"] if profile_id else "管理员")
+        self.events.append(event)
+        path = self.root / "events.jsonl"
+        if path.exists() and path.stat().st_size > 8_000_000:
+            os.replace(path, self.root / "events.previous.jsonl")
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def handle_event(self, identifier, run_id, event):
+        with self.lock:
+            runtime = self.runtime.get(identifier)
+            if not runtime or runtime["run_id"] != run_id or not isinstance(event, dict):
+                return
+            event = redact(event, (self.api_key, self.admin_secret))
+            kind = event.get("type")
+            if not isinstance(kind, str):
+                return
+            runtime["last_seen"] = timestamp()
+            if kind == "heartbeat":
+                if runtime["state"] not in ("stopping", "failed") and event.get("state") in ("idle", "working"):
+                    runtime["state"] = event["state"]
+                return
+            if kind == "ready":
+                runtime.update(agent_id=event.get("agent_id"), endpoint=event.get("endpoint"))
+                runtime["user_id"] = event.get("user_id")
+                if type(event.get("pid")) is int:
+                    runtime["pid"] = event["pid"]
+                if runtime["state"] == "starting":
+                    runtime["state"] = "idle"
+            elif kind == "state":
+                value = event.get("state")
+                if value in ("idle", "working", "stopped") and runtime["state"] != "stopping":
+                    runtime["state"] = value
+            elif kind in ("error", "control_error"):
+                runtime.update(state="failed", error=str(event.get("error", "Worker failed")))
+            elif kind == "worker_exit":
+                if record := self.processes.get(identifier):
+                    record["worker_exit"] = True
+                runtime["state"] = "failed" if event.get("failed") or runtime["error"] else "stopped"
+            elif kind == "admin_joined" and self.topic and event.get("topic_id") == self.topic["topic_id"]:
+                runtime["admin_joined"] = True
+                runtime.pop("invite_error", None)
+            elif kind == "admin_join_failed":
+                runtime["invite_error"] = event.get("error")
+            elif kind == "topic_joined":
+                deleted = {topic["topic_id"] for topic in self.data["deleted_topics"]}
+                if event.get("topic_id") not in deleted and event.get("topic_id") not in runtime["joined_topics"]:
+                    runtime["joined_topics"].append(event.get("topic_id"))
+            elif kind in ("topic_left", "topic_deleted"):
+                runtime["joined_topics"] = [t for t in runtime["joined_topics"] if t != event.get("topic_id")]
+                if kind == "topic_deleted" and (record := self.processes.get(identifier)):
+                    record.setdefault("deleted_topic_ids", set()).add(event.get("topic_id"))
+                    record.setdefault("topic_delete_errors", {}).pop(event.get("topic_id"), None)
+            elif kind == "topic_delete_failed":
+                if record := self.processes.get(identifier):
+                    record.setdefault("topic_delete_errors", {})[event.get("topic_id")] = event.get("error", "Delete failed")
+            elif kind in ("notice_received", "notice_applied"):
+                notice = next((n for n in self.data["notices"] if n["id"] == event.get("notice_id")), None)
+                if notice and identifier in notice["receipts"]:
+                    receipt = notice["receipts"][identifier]
+                    receipt.setdefault("received_at", timestamp())
+                    if kind == "notice_applied":
+                        receipt.update(status="applied", applied_at=timestamp())
+                    elif receipt["status"] != "applied":
+                        receipt["status"] = "received"
+                    self._save()
+            self._record_event(identifier, run_id, event)
+
+    def _read_worker(self, identifier, record):
+        process = record["process"]
+        try:
+            while raw := process.stdout.readline(1_048_577):
+                if len(raw) > 1_048_576:
+                    raise ValueError("Oversized worker event")
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                self.handle_event(identifier, record["run_id"], event)
+            code = process.wait()
+            with self.lock:
+                runtime = self.runtime.get(identifier)
+                if runtime and runtime["run_id"] == record["run_id"]:
+                    if not record["worker_exit"]:
+                        runtime.update(state="failed", error=(
+                            "SSH connection ended without shutdown confirmation; remote process state is unknown"
+                            if record["host_kind"] == "ssh" else f"Worker exited before handshake/cleanup (exit {code}); see run log"))
+                    runtime["admin_joined"] = False
+                    runtime["joined_topics"] = []
+                    runtime["pid"] = None
+        except Exception as exc:
+            self.handle_event(identifier, record["run_id"], {"type": "error", "error": str(exc)})
+        finally:
+            for stream in (process.stdin, process.stdout, record["log"]):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    def create_admin_topic(self, data):
+        name = required_text(data, "name", "管理员通知", limit=100)
+        description = data.get("description", "由控制台管理的通知频道")
+        if not isinstance(description, str) or len(description) > 1000:
+            raise ControlError("Invalid topic description")
+        with self.lock:
+            if self.topic:
+                raise ControlError("An administrator topic already exists", 409)
+            topic_id = self.comm.create_topic(name, description)
+            self.topic = {"topic_id": topic_id, "name": name, "description": description}
+            self.data["admin_topic"] = {"name": name, "description": description}
+            self._save()
+        self.invite_all()
+        return deepcopy(self.topic)
+
+    def _topic_deletion_state(self, topic):
+        """Caller holds self.lock; ACKs describe actual managed-worker completion."""
+        identifier = topic["topic_id"]
+        pending, errors = [], {}
+        for profile_id, record in self.processes.items():
+            live = record["process"].poll() is None
+            remote_unknown = (record.get("host_kind") == "ssh" and not record.get("worker_exit")
+                              and self.runtime.get(profile_id, {}).get("state") == "failed")
+            if (live or remote_unknown) and identifier not in record.get("deleted_topic_ids", ()):
+                pending.append(profile_id)
+                if not live and remote_unknown:
+                    errors[profile_id] = "Remote worker shutdown is unconfirmed; reconnect before deletion can be confirmed"
+                elif error := record.get("topic_delete_errors", {}).get(identifier):
+                    errors[profile_id] = error
+        return {**deepcopy(topic), "pending_profiles": pending, "errors": errors, "scope": "managed_agents"}
+
+    def _dispatch_topic_deletions(self):
+        """Retry on the authenticated local/SSH control channel, never over LAN discovery."""
+        with self.lock:
+            for topic in self.data["deleted_topics"]:
+                topic_id = topic["topic_id"]
+                for profile_id, record in self.processes.items():
+                    if record["process"].poll() is not None or topic_id in record.get("deleted_topic_ids", ()):
+                        continue
+                    key = (record["run_id"], topic_id)
+                    if time.monotonic() - self.last_delete_attempt.get(key, -10) < 5:
+                        continue
+                    self.last_delete_attempt[key] = time.monotonic()
+                    try:
+                        self._write_command(record, {"type": "delete_topic", "topic_id": topic_id})
+                        record.setdefault("topic_delete_errors", {}).pop(topic_id, None)
+                    except (OSError, ValueError):
+                        record.setdefault("topic_delete_errors", {})[topic_id] = "Worker control connection is unavailable; will retry"
+
+    def delete_topic(self, identifier):
+        """Retire a topic for this managed group, retaining its historical trace."""
+        with self.lock:
+            if self.topic and identifier == self.topic["topic_id"]:
+                raise ControlError("当前管理员通知频道用于全体通知，不能删除", 409)
+            existing = next((t for t in self.data["deleted_topics"] if t["topic_id"] == identifier), None)
+            if existing is None:
+                metadata = next((t for t in self.topic_cache if t["topic_id"] == identifier), None)
+                events = [e for e in self.events if e.get("topic_id") == identifier]
+                known_member = any(identifier in r["joined_topics"] for r in self.runtime.values())
+                if metadata is None and not events and not known_member:
+                    raise ControlError("Topic not found", 404)
+                name = (metadata or {}).get("name") or next(
+                    (e["topic_name"] for e in reversed(events) if e.get("topic_name")), identifier[:12])
+                existing = {"topic_id": identifier, "name": name, "deleted_at": timestamp()}
+                self.data["deleted_topics"].append(existing)
+                try:
+                    self._save()
+                except BaseException:
+                    self.data["deleted_topics"].remove(existing)
+                    raise
+                self.comm.leave_topic(identifier)
+                self.topic_cache = [t for t in self.topic_cache if t["topic_id"] != identifier]
+                for runtime in self.runtime.values():
+                    runtime["joined_topics"] = [t for t in runtime["joined_topics"] if t != identifier]
+                self._record_event(None, None, {"type": "topic_delete_requested", "topic_id": identifier,
+                                               "name": name, "scope": "managed_agents",
+                                               "summary": "Topic deleted for managed agents; historical trace retained"})
+            self._dispatch_topic_deletions()
+            return {"deleted": identifier, **self._topic_deletion_state(existing)}
+
+    def invite_all(self):
+        with self.lock:
+            if not self.topic:
+                raise ControlError("Create the administrator topic first", 409)
+            invited = []
+            for identifier, record in self.processes.items():
+                runtime = self.runtime[identifier]
+                if record["process"].poll() is not None or not runtime["agent_id"]:
+                    continue
+                if runtime["admin_joined"] or runtime["state"] in ("stopping", "stopped", "failed"):
+                    continue
+                try:
+                    self._write_command(record, {"type": "invite", "topic_id": self.topic["topic_id"],
+                                                 "admin_id": self.comm.agent_id, "secret": self.admin_secret})
+                    self.last_invite[identifier] = time.monotonic()
+                    invited.append(identifier)
+                except (OSError, ValueError):
+                    runtime["invite_error"] = "Worker control connection is unavailable"
+            return {"invited": invited}
+
+    def create_notice(self, data):
+        content = required_text(data, "content", limit=12000)
+        with self.lock:
+            if not self.topic:
+                raise ControlError("Create the administrator topic first", 409)
+            if not self.data["profiles"]:
+                raise ControlError("Create at least one agent profile first", 409)
+            targets = [{"profile_id": p["id"], "name": p["name"], "host_id": p["host_id"]}
+                       for p in self.data["profiles"]]
+            notice = {"id": uuid4().hex, "content": content, "created_at": timestamp(),
+                      "topic_id": self.topic["topic_id"], "targets": targets, "attempts": 0,
+                      "publish_error": None, "receipts": {t["profile_id"]: {"status": "pending"} for t in targets}}
+            self.data["notices"].append(notice)
+            self._save()
+        return self.publish_notice(notice["id"])
+
+    def publish_notice(self, identifier):
+        from agent.admin import sign_notice
+        with self.publish_lock:
+            with self.lock:
+                notice = next((n for n in self.data["notices"] if n["id"] == identifier), None)
+                if notice is None:
+                    raise ControlError("Notice not found", 404)
+                if not self.topic:
+                    raise ControlError("No administrator topic", 409)
+                pending = [i for i, r in notice["receipts"].items() if r["status"] != "applied"]
+                self.last_attempt[identifier] = time.monotonic()
+                if not pending or not any(self.runtime.get(i, {}).get("admin_joined") for i in pending):
+                    return deepcopy(notice)
+                envelope = {"kind": "admin.notice", "notice_id": notice["id"], "content": notice["content"],
+                            "targets": pending}
+                envelope["signature"] = sign_notice(envelope, self.admin_secret)
+                topic_id = self.topic["topic_id"]
+                notice["attempts"] += 1
+            error = None
+            try:
+                self.comm.send(topic_id, json.dumps(envelope, ensure_ascii=False))
+            except Exception as exc:
+                # send() may have partially delivered. Only runtime receipts
+                # prove which recipients actually accepted this notice.
+                error = f"{type(exc).__name__}: {exc}"
+            with self.lock:
+                notice["publish_error"] = error
+                notice["last_attempt_at"] = timestamp()
+                self._save()
+                return deepcopy(notice)
+
+    def _maintain(self):
+        while not self.closed.wait(1):
+            try:
+                with self.lock:
+                    should_invite = self.topic and any(
+                        r["agent_id"] and not r["admin_joined"] and time.monotonic() - self.last_invite.get(i, 0) > 5
+                        and r["state"] not in ("stopped", "stopping", "failed") for i, r in self.runtime.items())
+                    pending = [n["id"] for n in self.data["notices"]
+                               if any(r["status"] != "applied" for r in n["receipts"].values())
+                               and time.monotonic() - self.last_attempt.get(n["id"], 0) > 5]
+                if should_invite:
+                    self.invite_all()
+                self._dispatch_topic_deletions()
+                for identifier in pending:
+                    if self.closed.is_set():
+                        break
+                    self.publish_notice(identifier)
+                topics = [asdict(t) for t in self.comm.discover_topics()]
+                with self.lock:
+                    self.topic_cache = topics
+                if self.topic:
+                    self.comm.receive(self.topic["topic_id"])
+            except Exception:
+                # Per-worker and per-notice failures remain visible in state;
+                # temporary peer discovery errors must not stop reconciliation.
+                continue
+
+    def snapshot(self):
+        with self.lock:
+            profiles = [{**p, "runtime": deepcopy(self.runtime[p["id"]])} for p in self.data["profiles"]]
+            topics = {t["topic_id"]: deepcopy(t) for t in self.topic_cache}
+            if self.topic:
+                topics[self.topic["topic_id"]] = deepcopy(self.topic)
+            for p in profiles:
+                for identifier in p["runtime"]["joined_topics"]:
+                    topics.setdefault(identifier, {"topic_id": identifier, "name": identifier[:12], "description": ""})
+            deleted = {topic["topic_id"] for topic in self.data["deleted_topics"]}
+            topics = {identifier: topic for identifier, topic in topics.items() if identifier not in deleted}
+            for p in profiles:
+                p["runtime"]["joined_topics"] = [t for t in p["runtime"]["joined_topics"] if t not in deleted]
+            for topic in topics.values():
+                topic["is_admin"] = bool(self.topic and self.topic["topic_id"] == topic["topic_id"])
+                topic["can_delete"] = not topic["is_admin"]
+                topic["delete_reason"] = "当前管理员通知频道用于全体通知，不能删除" if topic["is_admin"] else None
+                topic["members"] = [{"profile_id": p["id"], "name": p["name"]} for p in profiles
+                                    if topic["topic_id"] in p["runtime"]["joined_topics"] or
+                                    (topic["is_admin"] and p["runtime"]["admin_joined"])]
+            return {"csrf_token": self.csrf_token, "credentials_configured": bool(self.api_key),
+                    "admin": {"agent_id": self.comm.agent_id, "endpoint": self.comm.endpoint, "topic": deepcopy(self.topic)},
+                    "hosts": deepcopy(self.data["hosts"]), "profiles": profiles, "topics": list(topics.values()),
+                    "deleted_topic_ids": sorted(deleted),
+                    "topic_deletions": [self._topic_deletion_state(t) for t in self.data["deleted_topics"]],
+                    "notices": deepcopy(list(reversed(self.data["notices"]))), "events": deepcopy(list(self.events))}
+
+    def close(self):
+        if self.closed.is_set():
+            return
+        self.closed.set()
+        for identifier in list(self.processes):
+            self.stop_profile(identifier)
+        deadline = time.monotonic() + 10
+        for record in list(self.processes.values()):
+            try:
+                record["process"].wait(timeout=max(.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                # Close the control channel; remote worker EOF requests stop.
+                try:
+                    record["process"].stdin.close()
+                except (OSError, ValueError):
+                    pass
+                record["process"].terminate()
+        if self.thread:
+            self.thread.join(timeout=3)
+        self.comm.close()
+        self.lease.close()
+        self.api_key = ""
