@@ -32,7 +32,7 @@ function harness(profiles, { credentials = true, request = async () => ({ state:
   });
   vm.runInContext(source.slice(0, bootstrap) + `
     globalThis.consoleTest = {
-      ui, busy,
+      ui, busy, chatHistories, observedTopics,
       get data() { return data; },
       setup(state, hooks) {
         data = state; connected = true;
@@ -53,6 +53,8 @@ function harness(profiles, { credentials = true, request = async () => ({ state:
       canDeleteTopic,
       topicDeleteAction,
       renderTopicDeletionStatus,
+      renderCleanupStatus,
+      profileActions,
       history: chatHistory,
       refreshHistory: refreshTopicHistory,
       historyControls: renderHistoryControls,
@@ -226,10 +228,10 @@ test('retry selects only failures and never resubmits successful profiles', asyn
 
 function snapshot(extra = {}) {
   return { profiles: [], hosts: [], topics: [], events: [], notices: [], admin: {},
-    deleted_topic_ids: [], csrf_token: 'test-csrf', ...extra };
+    deleted_topic_ids: [], deleted_profile_ids: [], csrf_token: 'test-csrf', ...extra };
 }
 
-test('deleted topics stay absent despite stale discovery and retained history or cached metadata', async () => {
+test('deleted topics stay absent despite stale discovery, events, or cached metadata', async () => {
   const deleted = { topic_id: 'deleted', name: 'Former room', description: 'Cached description' };
   let response = snapshot({ topics: [deleted] });
   const { app, observations } = harness([], { request: async () => response });
@@ -244,7 +246,8 @@ test('deleted topics stay absent despite stale discovery and retained history or
   await app.refresh(true);
   assert.deepEqual(Array.from(app.data.topics, topic => topic.topic_id), ['live', 'ordinary-history']);
   assert.equal(app.data.topics[1].is_historical, true, 'Non-deleted history remains available');
-  assert.equal(app.data.events.length, 2, 'Deletion must not erase retained trace events');
+  assert.deepEqual(Array.from(app.data.events, event => event.id), ['sent-2'],
+    'Events belonging to the deleted topic must not remain in trace or resurrect a room');
   response = snapshot({ events, deleted_topic_ids: ['deleted'] });
   await app.refresh(true);
   assert.deepEqual(Array.from(app.data.topics, topic => topic.topic_id), ['ordinary-history'],
@@ -304,6 +307,69 @@ test('pending deletion status lists affected agents and safely renders names and
   assert.equal(app.renderTopicDeletionStatus(), '', 'Completed deletions no longer show as pending');
 });
 
+test('pending cascade cleanup disables start and edit while exposing an escaped retry status', async () => {
+  const pending = { ...profile('pending'), runtime: { state: 'stopped', cleanup_pending: true } };
+  const { app, select, observations } = harness([pending, profile('ready')]);
+  assert.equal(app.canStart(pending), false);
+  select('pending', 'ready');
+  app.reconcile();
+  assert.deepEqual(selected(app), ['ready'], 'A pending deletion must not join a batch start');
+  const actions = app.profileActions(pending);
+  assert.match(actions, /<button[^>]*data-action="start-profile"[^>]* disabled>/);
+  assert.match(actions, /<button[^>]*data-action="edit-profile"[^>]* disabled>/);
+  assert.match(actions, /<button[^>]*data-action="delete-profile"[^>]*>[^]*?重试清理/);
+  assert.doesNotMatch(actions, /<button[^>]*data-action="delete-profile"[^>]* disabled>/);
+  assert.match(actions, /清理中/);
+  await app.action('start-profile', 'pending');
+  await app.action('edit-profile', 'pending');
+  assert.equal(observations.requests.length, 0, 'Even a stale action must not start a pending deletion');
+  assert.equal(observations.forms.length, 0);
+  assert.equal(observations.toasts.length, 2);
+  assert.ok(observations.toasts.every(item => item.error && item.message.includes('正在清理关联数据')));
+  app.data.cleanup_jobs = [
+    { kind: 'profile', id: 'pending', name: '<img src=x onerror=evil()> & alice', error: 'Workspace <locked> & retry' },
+    { kind: 'topic', id: 'room', name: 'Town room', error: 'Archive <unavailable>' },
+  ];
+  const status = app.renderCleanupStatus();
+  assert.match(status, /role="status"/);
+  assert.match(status, /Agent 删除尚未完成/);
+  assert.match(status, /Topic 删除尚未完成/);
+  assert.match(status, /自动重试；重启服务后也会继续/);
+  assert.match(status, /&lt;img src=x onerror=evil\(\)&gt; &amp; alice/);
+  assert.match(status, /Workspace &lt;locked&gt; &amp; retry/);
+  assert.match(status, /Archive &lt;unavailable&gt;/);
+  assert.doesNotMatch(status, /<img src=x|<locked>|<unavailable>/);
+  app.data.cleanup_jobs = [];
+  assert.equal(app.renderCleanupStatus(), '');
+});
+
+test('agent and topic deletion confirmations disclose cascade scope without sending a request', async () => {
+  const person = { ...profile('a'), name: '<script>alice</script>' };
+  const { app, observations } = harness([person]);
+  app.data.topics = [{ topic_id: 'room', name: '<img src=x> & town', members: [] }];
+  await app.action('delete-profile', 'a');
+  await app.action('delete-topic', 'room');
+  assert.equal(observations.requests.length, 0, 'Confirmations must precede destructive requests');
+  assert.equal(observations.forms.length, 2);
+  const [agentKind, , agentBody, , agentId] = observations.forms[0];
+  assert.equal(agentKind, 'delete-profile'); assert.equal(agentId, 'a');
+  assert.match(agentBody, /&lt;script&gt;alice&lt;\/script&gt;/);
+  assert.doesNotMatch(agentBody, /<script>/);
+  assert.match(agentBody, /历史、记忆、定时任务和生成文件/);
+  assert.match(agentBody, /运行日志、该 Agent 的聊天与执行记录，以及通知目标和回执/);
+  assert.match(agentBody, /共享 Topic 和其他成员的记录保留/);
+  assert.match(agentBody, /离线也会清理/);
+  assert.match(agentBody, /此操作不可恢复/);
+  const [topicKind, , topicBody, , topicId] = observations.forms[1];
+  assert.equal(topicKind, 'delete-topic'); assert.equal(topicId, 'room');
+  assert.match(topicBody, /&lt;img src=x&gt; &amp; town/);
+  assert.doesNotMatch(topicBody, /<img src=x>/);
+  assert.match(topicBody, /聊天、执行记录、成员关系，以及关联通知和回执/);
+  assert.match(topicBody, /离线成员下次启动前同步/);
+  assert.match(topicBody, /保留 Agent 人设、已形成的记忆和其他话题/);
+  assert.match(topicBody, /此操作不可恢复/);
+});
+
 function archived(seq, content = `Message ${seq}`, extra = {}) {
   return { seq, key: `event-${seq}`, topic_id: 'town', profile_id: 'a', author: 'alice',
     ts: new Date(1700000000000 + seq * 1000).toISOString(), content, truncated: false, ...extra };
@@ -333,6 +399,152 @@ function openChat(app, extra = {}) {
   app.data.topics = [topic];
   app.ui.page = 'topics'; app.ui.id = topic.topic_id; app.ui.chatQuery = '';
   return topic;
+}
+
+test('profile deletion invalidates all cached chat pages and searches while preserving shared topics', async () => {
+  const town = { topic_id: 'town', name: 'Town chat', members: [] };
+  let revision = 1;
+  let records = [archived(1, 'alice former message'), archived(2, 'bobe retained message', { profile_id: 'b', author: 'bobe' })];
+  let state = snapshot({ history_revision: revision, profiles: [profile('a'), profile('b')],
+    topics: [town, { topic_id: 'retired', name: 'Old discovery' }] });
+  const { app, observations } = harness([], { request: async url => url === '/api/state' ? state
+    : { ...await historyServer(records)(url), history_revision: revision } });
+  await app.refresh(true);
+  openChat(app);
+  await app.refreshHistory();
+  const oldHistory = app.history();
+  app.ui.chatQuery = 'alice';
+  await app.refreshHistory();
+  assert.equal(app.history().messages[0].profile_id, 'a');
+  assert.equal(app.chatHistories.size, 2);
+  app.ui.chatScroll.set('town', { top: 200, height: 1000 });
+  app.ui.expandedEvents.add('alice-run');
+  app.ui.traceProfile = 'a';
+  app.ui.page = 'overview';
+  revision = 2;
+  records = records.filter(message => message.profile_id !== 'a');
+  state = snapshot({ history_revision: revision, profiles: [profile('b')], topics: [town],
+    deleted_profile_ids: ['a'], events: [
+      { id: 'removed-author', type: 'message_sent', profile_id: 'a', topic_id: 'town' },
+      { id: 'removed-trace', type: 'model_started', profile_id: 'a' },
+      { id: 'removed-discovery', type: 'message_sent', profile_id: 'a', topic_id: 'retired' },
+      { id: 'retained', type: 'message_sent', profile_id: 'b', topic_id: 'town' },
+    ] });
+  await app.refresh(true);
+  assert.equal(app.chatHistories.size, 0, 'Both ordinary and search pages must be invalidated');
+  assert.deepEqual(Array.from(app.observedTopics.keys()), ['town']);
+  assert.equal(app.ui.chatScroll.size, 0);
+  assert.equal(app.ui.expandedEvents.size, 0);
+  assert.equal(app.ui.traceProfile, '');
+  assert.deepEqual(Array.from(app.data.events, event => event.id), ['retained']);
+  assert.deepEqual(Array.from(app.data.topics, topic => topic.topic_id), ['town']);
+  const topic = openChat(app);
+  await app.refreshHistory();
+  assert.notEqual(app.history(), oldHistory);
+  assert.deepEqual(Array.from(app.topicMessages(topic), message => message.profileId), ['b']);
+  assert.doesNotMatch(observations.requests.at(-1).url, /before=|after=/,
+    'After a purge the shared topic must restart from a complete fresh page');
+});
+
+test('an in-flight history response cannot restore a deleted author or overwrite a replacement cache', async () => {
+  let resolveOldPage;
+  let historyRequests = 0;
+  let state = snapshot({ history_revision: 1, profiles: [profile('a'), profile('b')],
+    topics: [{ topic_id: 'town', name: 'Town chat', members: [] }] });
+  const retained = archived(2, 'bobe retained message', { profile_id: 'b', author: 'bobe' });
+  const { app, observations } = harness([], { request: url => {
+    if (url === '/api/state') return Promise.resolve(state);
+    if (++historyRequests === 1) return new Promise(resolve => { resolveOldPage = resolve; });
+    return Promise.resolve({ messages: [retained], total: 1, has_more: false,
+      next_before: 2, latest_cursor: 2, history_revision: 2 });
+  } });
+  await app.refresh(true);
+  const topic = openChat(app);
+  const pending = app.refreshHistory();
+  const oldHistory = app.history();
+  app.ui.page = 'overview';
+  state = { ...state, history_revision: 2, profiles: [profile('b')], deleted_profile_ids: ['a'] };
+  await app.refresh(true);
+  openChat(app);
+  await app.refreshHistory();
+  const freshHistory = app.history();
+  const renders = observations.renders;
+  resolveOldPage({ messages: [archived(1, 'alice deleted message')], total: 2, has_more: true,
+    next_before: 1, latest_cursor: 1, history_revision: 1 });
+  await pending;
+  assert.equal(app.history(), freshHistory);
+  assert.notEqual(freshHistory, oldHistory);
+  assert.equal(oldHistory.messages.length, 0, 'A detached cache must not consume late pages');
+  assert.deepEqual(Array.from(app.topicMessages(topic), message => message.profileId), ['b']);
+  assert.equal(freshHistory.total, 1);
+  assert.equal(freshHistory.newest, 2);
+  assert.equal(freshHistory.moreBefore, false);
+  assert.equal(observations.renders, renders, 'A detached request must not repaint the replacement view');
+});
+
+test('topic tombstones evict every cached query and reject a pending page without a revision change', async () => {
+  let resolveOldPage;
+  let historyRequests = 0;
+  let state = snapshot({ topics: [{ topic_id: 'town', name: 'Town chat', members: [] }] });
+  const { app, observations } = harness([], { request: url => {
+    if (url === '/api/state') return Promise.resolve(state);
+    if (++historyRequests === 3) return new Promise(resolve => { resolveOldPage = resolve; });
+    return Promise.resolve({ messages: [archived(1, 'Old room message')], total: 1,
+      has_more: false, next_before: 1, latest_cursor: 1 });
+  } });
+  await app.refresh(true);
+  openChat(app);
+  await app.refreshHistory();
+  app.ui.chatQuery = 'Old';
+  await app.refreshHistory();
+  app.ui.chatQuery = '';
+  const pending = app.refreshHistory();
+  const unrelated = app.history('other', '');
+  app.ui.page = 'overview';
+  state = snapshot({ topics: state.topics, deleted_topic_ids: ['town'], events: [
+    { id: 'stale', type: 'message_sent', topic_id: 'town', topic_name: 'Old room' },
+    { id: 'kept', type: 'message_sent', topic_id: 'other', topic_name: 'Other room' },
+  ] });
+  await app.refresh(true);
+  assert.deepEqual(Array.from(app.chatHistories.values(), history => history.topicId), ['other']);
+  assert.equal(app.history('other', ''), unrelated, 'Unrelated legacy caches remain usable');
+  assert.equal(app.observedTopics.has('town'), false);
+  assert.deepEqual(Array.from(app.data.topics, topic => topic.topic_id), ['other']);
+  assert.deepEqual(Array.from(app.data.events, event => event.id), ['kept']);
+  const renders = observations.renders;
+  resolveOldPage({ messages: [archived(2, 'Late deleted room message')], total: 2,
+    has_more: false, next_before: 2, latest_cursor: 2 });
+  await pending;
+  assert.equal(observations.renders, renders);
+  assert.deepEqual(Array.from(app.chatHistories.values(), history => history.topicId), ['other']);
+  app.ui.page = 'topics'; app.ui.id = 'town';
+  const requests = observations.requests.length;
+  await app.refreshHistory();
+  assert.equal(observations.requests.length, requests, 'A deleted topic must not fetch or recreate its cache');
+  assert.equal(app.chatHistories.size, 1);
+});
+
+for (const responseRevision of [1, 3]) {
+  test(`history page revision ${responseRevision} cannot merge into state revision 2`, async () => {
+    let historyRequests = 0;
+    const { app, observations } = harness([], { request: async () => {
+      const initial = ++historyRequests === 1;
+      return { messages: [archived(initial ? 2 : 3, initial ? 'Current message' : 'Mismatched page')],
+        total: initial ? 1 : 99, has_more: false, next_before: initial ? 2 : 3,
+        latest_cursor: initial ? 2 : 3, history_revision: initial ? 2 : responseRevision };
+    } });
+    app.data.history_revision = 2;
+    const topic = openChat(app);
+    await app.refreshHistory();
+    await app.refreshHistory();
+    assert.deepEqual(Array.from(app.topicMessages(topic), message => message.content), ['Current message']);
+    assert.equal(app.history().total, 1);
+    assert.equal(app.history().newest, 2);
+    assert.equal(app.history().before, 2);
+    assert.equal(app.history().loading, false);
+    assert.deepEqual(observations.refreshes, responseRevision > 2 ? [true] : [],
+      'Only a page from a newer archive revision should request a fresh state snapshot');
+  });
 }
 
 test('history pages retain more than 400 full messages while new arrivals merge without duplicates', async () => {

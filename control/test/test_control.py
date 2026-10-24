@@ -136,7 +136,7 @@ class ControlCase(unittest.TestCase):
 
 
 class PersistenceAndSSHTests(ControlCase):
-    def test_delete_profile_preserves_workspace_events_and_frozen_notice_receipts(self):
+    def test_delete_profile_cascades_workspace_events_and_notice_targets(self):
         service = self.service()
         removed = service.save_profile(profile_data("remove-me"))
         remaining = service.save_profile(profile_data("keep-me"))
@@ -154,30 +154,29 @@ class PersistenceAndSSHTests(ControlCase):
         service.handle_event(identifier, "prior-run", {"type": "model_finished", "status": "completed",
                                                       "output": "Prior work finished."})
         prior_events = service.snapshot()["events"]
-        self.assertEqual(service.delete_profile(identifier), {"deleted": identifier})
+        result = service.delete_profile(identifier)
+        self.assertEqual(result["deleted"], identifier)
+        self.assertFalse(result["cleanup_pending"])
         state = service.snapshot()
         self.assertEqual([p["id"] for p in state["profiles"]], [remaining["id"]])
         self.assertNotIn(identifier, service.runtime)
-        self.assertEqual(state["notices"][0], notice)
-        self.assertEqual(state["notices"][0]["receipts"][identifier]["status"], "pending")
-        self.assertTrue(all(event in state["events"] for event in prior_events))
-        self.assertTrue(any(event["type"] == "profile_deleted" and event["profile_id"] == identifier
-                            for event in state["events"]))
-        self.assertEqual(history_path.read_text(), history_text)
-        self.assertEqual(artifact.read_text(), "Saved agent artifact.")
+        expected_notice = {**notice, "targets": [t for t in notice["targets"] if t["profile_id"] != identifier],
+                           "receipts": {k: v for k, v in notice["receipts"].items() if k != identifier}}
+        self.assertEqual(state["notices"][0], expected_notice)
+        self.assertFalse(any(event in state["events"] for event in prior_events))
+        self.assertFalse(workspace.exists())
         saved = json.loads(service.path.read_text())
         self.assertEqual([p["id"] for p in saved["profiles"]], [remaining["id"]])
-        self.assertEqual(saved["notices"], [notice])
+        self.assertEqual(saved["notices"], [expected_notice])
         with self.assertRaises(ControlError) as missing:
             service.delete_profile(identifier)
         self.assertEqual(missing.exception.status, 404)
         service.close()
         restored = self.service()
         self.assertEqual([p["id"] for p in restored.snapshot()["profiles"]], [remaining["id"]])
-        self.assertEqual(restored.snapshot()["notices"][0], notice)
-        self.assertTrue(all(event in restored.snapshot()["events"] for event in prior_events))
-        self.assertEqual(history_path.read_text(), history_text)
-        self.assertEqual(artifact.read_text(), "Saved agent artifact.")
+        self.assertEqual(restored.snapshot()["notices"][0], expected_notice)
+        self.assertFalse(any(event in restored.snapshot()["events"] for event in prior_events))
+        self.assertFalse(workspace.exists())
 
     def test_delete_profile_refuses_any_live_process_without_mutating_saved_configuration(self):
         service = self.service()
@@ -450,7 +449,8 @@ class HTTPProtectionTests(ControlCase):
             self.control.processes.pop(identifier, None)
         status, result = self.request("DELETE", path, {}, headers)
         self.assertEqual(status, 200)
-        self.assertEqual(result, {"deleted": identifier})
+        self.assertEqual(result["deleted"], identifier)
+        self.assertFalse(result["cleanup_pending"])
         self.assertEqual(self.request()[1]["profiles"], [])
         self.assertEqual(self.request("DELETE", path, {}, headers)[0], 404)
 

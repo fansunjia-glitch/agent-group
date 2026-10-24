@@ -60,7 +60,7 @@ class TopicDeletionTests(ControlCase):
         self.addCleanup(node.close)
         return node, node.create_topic("External-owned discussion")
 
-    def test_delete_preserves_history_and_hides_stale_membership_discovery_after_restart(self):
+    def test_delete_purges_history_and_hides_stale_membership_discovery_after_restart(self):
         service = self.service()
         external, topic_id = self.external_topic()
         service.topic_cache = [asdict(t) for t in external.discover_topics()]
@@ -83,7 +83,7 @@ class TopicDeletionTests(ControlCase):
         state = service.snapshot()
         self.assertNotIn(topic_id, {t["topic_id"] for t in state["topics"]})
         self.assertNotIn(topic_id, state["profiles"][0]["runtime"]["joined_topics"])
-        self.assertIn(prior_event, state["events"])
+        self.assertNotIn(prior_event, state["events"])
         self.assertIn(topic_id, state["deleted_topic_ids"])
         self.assertEqual(service.delete_topic(topic_id)["deleted"], topic_id)
         self.assertEqual(len(service.data["deleted_topics"]), 1)
@@ -91,7 +91,7 @@ class TopicDeletionTests(ControlCase):
         restored = self.service()
         restored.topic_cache = [asdict(t) for t in external.discover_topics()]
         self.assertNotIn(topic_id, {t["topic_id"] for t in restored.snapshot()["topics"]})
-        self.assertIn(prior_event, restored.snapshot()["events"])
+        self.assertNotIn(prior_event, restored.snapshot()["events"])
         self.assertEqual(restored.snapshot()["deleted_topic_ids"], [topic_id])
 
     def test_historical_topic_can_be_deleted_but_admin_and_unknown_cannot(self):
@@ -194,7 +194,7 @@ class TopicDeletionTests(ControlCase):
                           service=service, label="actual worker deletion acknowledgements")
             self.assertTrue(all(topic_id not in peer["topics"] for peer in external._refresh()
                                 if peer["agent_id"] != external.agent_id))
-            self.assertEqual(sum(e["type"] == "topic_deleted" for e in service.snapshot()["events"]), 2)
+            self.assertFalse(any(e.get("topic_id") == topic_id for e in service.snapshot()["events"]))
             first = profiles[0]["id"]
             service.stop_profile(first)
             self.wait_for(lambda: service.processes[first]["process"].poll() is not None

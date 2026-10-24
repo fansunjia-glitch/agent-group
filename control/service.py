@@ -21,7 +21,8 @@ from uuid import uuid4
 from comm import Comm
 from agent.identity import profile_user_id, validate_user_id
 from .redact import redact
-from .history import TopicHistory
+from .history import TopicHistory, event_references_topic
+from .cleanup import CleanupBlocked, locked_workspace, remove_profile_files, scrub_event_logs
 
 
 class ControlError(Exception):
@@ -76,8 +77,9 @@ class ControlService:
         self.last_attempt = {}
         self.last_invite = {}
         self.last_delete_attempt = {}
+        self.last_cleanup_attempt = {}
         self.data = {"version": 1, "profiles": [], "hosts": [], "notices": [], "admin_topic": None,
-                     "deleted_topics": []}
+                     "deleted_topics": [], "deleted_profile_ids": [], "cleanup_jobs": []}
         try:
             if self.path.exists():
                 loaded = json.loads(self.path.read_text())
@@ -107,6 +109,9 @@ class ControlService:
         self.history_recovery = {}
         try:
             self.history = TopicHistory(self.root / "history.sqlite3")
+            # Only explicit deletion intents are resumed. Older topic-retirement
+            # records did not authorize purging history on upgrade.
+            self._retry_cleanup_jobs(force=True)
             self.history.import_legacy(self.root, self.data["notices"])
             from .history_recovery import recover_truncated_sends
             recovered, self.history_recovery = recover_truncated_sends(
@@ -173,6 +178,8 @@ class ControlService:
         with self.lock:
             if identifier:
                 self._profile(identifier)
+                if self._cleanup_job("profile", identifier):
+                    raise ControlError("Agent deletion is pending; retry cleanup before editing", 409)
                 proc = self.processes.get(identifier)
                 if proc and proc["process"].poll() is None:
                     raise ControlError("Stop the agent before editing its profile", 409)
@@ -211,21 +218,126 @@ class ControlService:
             return deepcopy(profile)
 
     def delete_profile(self, identifier):
+        # poll() can report exit while the reader still owns its log and waits
+        # for self.lock. Drain it outside the lock, then recheck under the lock.
         with self.lock:
             self._profile(identifier)
             record = self.processes.get(identifier)
             if record and record["process"].poll() is None:
                 raise ControlError("Stop the agent before deleting its profile", 409)
-            # Keep independent workspaces, trace events and frozen notification
-            # targets intact. Removing a profile must not rewrite past receipts.
-            self._record_event(identifier, self.runtime[identifier]["run_id"],
-                               {"type": "profile_deleted", "summary": "Agent profile deleted; history retained"})
-            self.data["profiles"] = [p for p in self.data["profiles"] if p["id"] != identifier]
-            self.runtime.pop(identifier, None)
-            self.processes.pop(identifier, None)
-            self.last_invite.pop(identifier, None)
+            reader = record.get("reader") if record else None
+        if reader:
+            reader.join(timeout=3)
+            if reader.is_alive():
+                raise ControlError("Agent output is still draining; retry deletion shortly", 409)
+        with self.publish_lock, self.lock:
+            profile = self._profile(identifier)
+            self._check_profile_cleanup(identifier)
+            job = self._cleanup_job("profile", identifier)
+            if job is None:
+                # Detect an orphaned local worker before accepting deletion.
+                try:
+                    with locked_workspace(self.root, identifier):
+                        pass
+                except (CleanupBlocked, OSError) as exc:
+                    raise ControlError(str(exc), 409) from exc
+                job = {"kind": "profile", "id": identifier, "name": profile["name"], "created_at": timestamp()}
+                self.data["cleanup_jobs"].append(job)
+                try:
+                    self._save()
+                except BaseException:
+                    self.data["cleanup_jobs"].remove(job)
+                    raise
+            self._attempt_cleanup(job)
+            return {"deleted": identifier, **self._cleanup_state("profile", identifier)}
+
+    def _cleanup_job(self, kind, identifier):
+        return next((job for job in self.data["cleanup_jobs"]
+                     if job["kind"] == kind and job["id"] == identifier), None)
+
+    def _cleanup_state(self, kind, identifier):
+        job = self._cleanup_job(kind, identifier)
+        return {"cleanup_pending": job is not None, "cleanup_error": job.get("error") if job else None,
+                "history_revision": self.history.revision()}
+
+    def _check_profile_cleanup(self, identifier):
+        profile = self._profile(identifier)
+        record = self.processes.get(identifier)
+        if record and record["process"].poll() is None:
+            raise ControlError("Stop the agent before deleting its profile", 409)
+        if record and (reader := record.get("reader")) and reader.is_alive():
+            raise ControlError("Agent output is still draining; retry deletion shortly", 409)
+        # An SSH transport exit cannot prove the remote worker or workspace is
+        # gone. Until remote cleanup is verified, retain its configuration.
+        if self._host(profile["host_id"])["kind"] == "ssh" or (record and record.get("host_kind") == "ssh"):
+            raise ControlError("This version cannot verify remote workspace cleanup; the SSH agent configuration has been retained", 409)
+
+    def _attempt_cleanup(self, job):
+        """Complete an already-persisted intent, or leave a retryable journal.
+
+        Caller holds publish_lock then self.lock. A committed SQLite tombstone
+        makes partial file/config failures safe against late-event resurrection.
+        """
+        kind, identifier = job["kind"], job["id"]
+        self.last_cleanup_attempt[(kind, identifier)] = time.monotonic()
+        previous = deepcopy(self.data)
+        try:
+            if kind == "profile":
+                self._check_profile_cleanup(identifier)
+                with locked_workspace(self.root, identifier) as workspace:
+                    self.history.delete_profile(identifier)
+                    self.events = deque((e for e in self.events if e.get("profile_id") != identifier), maxlen=400)
+                    scrub_event_logs(self.root, lambda e: e.get("profile_id") == identifier)
+                    remove_profile_files(self.root, identifier, workspace)
+                self.data["profiles"] = [p for p in self.data["profiles"] if p["id"] != identifier]
+                if identifier not in self.data["deleted_profile_ids"]:
+                    self.data["deleted_profile_ids"].append(identifier)
+                for notice in self.data["notices"]:
+                    notice["targets"] = [t for t in notice["targets"] if t["profile_id"] != identifier]
+                    notice["receipts"].pop(identifier, None)
+            elif kind == "topic":
+                self.history.delete_topic(identifier)
+                self.events = deque((e for e in self.events if not event_references_topic(e, identifier)), maxlen=400)
+                scrub_event_logs(self.root, lambda e: event_references_topic(e, identifier))
+                self.comm.leave_topic(identifier)
+                self.topic_cache = [t for t in self.topic_cache if t["topic_id"] != identifier]
+                for runtime in self.runtime.values():
+                    runtime["joined_topics"] = [t for t in runtime["joined_topics"] if t != identifier]
+                self.data["notices"] = [n for n in self.data["notices"] if n.get("topic_id") != identifier]
+            else:
+                raise ValueError("Unknown cleanup job kind")
+            self.data["cleanup_jobs"] = [j for j in self.data["cleanup_jobs"]
+                                         if (j["kind"], j["id"]) != (kind, identifier)]
             self._save()
-            return {"deleted": identifier}
+        except Exception as exc:
+            self.data = previous
+            pending = self._cleanup_job(kind, identifier)
+            pending["error"] = str(redact(str(exc), (self.api_key, self.admin_secret)))
+            pending["last_attempt_at"] = timestamp()
+            try:
+                self._save()
+            except Exception:
+                # The original intent was already committed. It will retry on
+                # restart even when recording the newest error also fails.
+                pass
+            return
+        if kind == "profile":
+            self.runtime.pop(identifier, None)
+            record = self.processes.pop(identifier, None)
+            if record:
+                self.last_delete_attempt = {key: value for key, value in self.last_delete_attempt.items()
+                                            if key[0] != record.get("run_id")}
+            self.last_invite.pop(identifier, None)
+        self.last_cleanup_attempt.pop((kind, identifier), None)
+        valid_notices = {n["id"] for n in self.data["notices"]}
+        self.last_attempt = {key: value for key, value in self.last_attempt.items() if key in valid_notices}
+
+    def _retry_cleanup_jobs(self, *, force=False):
+        with self.publish_lock, self.lock:
+            for job in list(self.data["cleanup_jobs"]):
+                key = (job["kind"], job["id"])
+                if force or time.monotonic() - self.last_cleanup_attempt.get(key, -10) >= 5:
+                    self._attempt_cleanup(job)
 
     def add_host(self, data):
         if data.get("kind", "ssh") != "ssh":
@@ -283,6 +395,8 @@ class ControlService:
             if self.closed.is_set():
                 raise ControlError("Control service is shutting down", 409)
             profile = deepcopy(self._profile(identifier))
+            if self._cleanup_job("profile", identifier):
+                raise ControlError("Agent deletion is pending; retry cleanup before starting", 409)
             existing = self.processes.get(identifier)
             if existing and existing["process"].poll() is None:
                 raise ControlError("Agent is already running or stopping", 409)
@@ -355,6 +469,11 @@ class ControlService:
         return preview
 
     def _record_event(self, profile_id, run_id, event):
+        deleted_profiles = set(self.data["deleted_profile_ids"])
+        deleted_profiles.update(j["id"] for j in self.data["cleanup_jobs"] if j["kind"] == "profile")
+        if profile_id in deleted_profiles or any(
+                event_references_topic(event, topic["topic_id"]) for topic in self.data["deleted_topics"]):
+            return
         # Protocol fields containing credentials are never retained or returned.
         event = {k: v for k, v in event.items() if k not in ("api_key", "secret", "signature", "reasoning_content")}
         event = redact(event, (self.api_key, self.admin_secret))
@@ -512,14 +631,15 @@ class ControlService:
                         record.setdefault("topic_delete_errors", {})[topic_id] = "Worker control connection is unavailable; will retry"
 
     def delete_topic(self, identifier):
-        """Retire a topic for this managed group, retaining its historical trace."""
-        with self.lock:
+        """Persist a deletion intent before purging records and retiring membership."""
+        with self.publish_lock, self.lock:
             if self.topic and identifier == self.topic["topic_id"]:
                 raise ControlError("当前管理员通知频道用于全体通知，不能删除", 409)
             existing = next((t for t in self.data["deleted_topics"] if t["topic_id"] == identifier), None)
+            previous = deepcopy(self.data)
             if existing is None:
                 metadata = next((t for t in self.topic_cache if t["topic_id"] == identifier), None) or self.history.topic(identifier)
-                events = [e for e in self.events if e.get("topic_id") == identifier]
+                events = [e for e in self.events if event_references_topic(e, identifier)]
                 known_member = any(identifier in r["joined_topics"] for r in self.runtime.values())
                 if metadata is None and not events and not known_member:
                     raise ControlError("Topic not found", 404)
@@ -527,20 +647,19 @@ class ControlService:
                     (e["topic_name"] for e in reversed(events) if e.get("topic_name")), identifier[:12])
                 existing = {"topic_id": identifier, "name": name, "deleted_at": timestamp()}
                 self.data["deleted_topics"].append(existing)
+            job = self._cleanup_job("topic", identifier)
+            if job is None:
+                job = {"kind": "topic", "id": identifier, "name": existing["name"], "created_at": timestamp()}
+                self.data["cleanup_jobs"].append(job)
                 try:
                     self._save()
                 except BaseException:
-                    self.data["deleted_topics"].remove(existing)
+                    self.data = previous
                     raise
-                self.comm.leave_topic(identifier)
-                self.topic_cache = [t for t in self.topic_cache if t["topic_id"] != identifier]
-                for runtime in self.runtime.values():
-                    runtime["joined_topics"] = [t for t in runtime["joined_topics"] if t != identifier]
-                self._record_event(None, None, {"type": "topic_delete_requested", "topic_id": identifier,
-                                               "name": name, "scope": "managed_agents",
-                                               "summary": "Topic deleted for managed agents; historical trace retained"})
+            self._attempt_cleanup(job)
             self._dispatch_topic_deletions()
-            return {"deleted": identifier, **self._topic_deletion_state(existing)}
+            return {"deleted": identifier, **self._topic_deletion_state(existing),
+                    **self._cleanup_state("topic", identifier)}
 
     def invite_all(self):
         with self.lock:
@@ -567,10 +686,11 @@ class ControlService:
         with self.lock:
             if not self.topic:
                 raise ControlError("Create the administrator topic first", 409)
-            if not self.data["profiles"]:
+            profiles = [p for p in self.data["profiles"] if not self._cleanup_job("profile", p["id"])]
+            if not profiles:
                 raise ControlError("Create at least one agent profile first", 409)
             targets = [{"profile_id": p["id"], "name": p["name"], "host_id": p["host_id"]}
-                       for p in self.data["profiles"]]
+                       for p in profiles]
             notice = {"id": uuid4().hex, "content": content, "created_at": timestamp(),
                       "topic_id": self.topic["topic_id"], "targets": targets, "attempts": 0,
                       "publish_error": None, "receipts": {t["profile_id"]: {"status": "pending"} for t in targets}}
@@ -609,7 +729,10 @@ class ControlService:
                     raise ControlError("Notice not found", 404)
                 if not self.topic:
                     raise ControlError("No administrator topic", 409)
-                pending = [i for i, r in notice["receipts"].items() if r["status"] != "applied"]
+                if any(t["topic_id"] == notice.get("topic_id") for t in self.data["deleted_topics"]):
+                    return deepcopy(notice)
+                pending = [i for i, r in notice["receipts"].items()
+                           if r["status"] != "applied" and not self._cleanup_job("profile", i)]
                 self.last_attempt[identifier] = time.monotonic()
                 if not pending or not any(self.runtime.get(i, {}).get("admin_joined") for i in pending):
                     return deepcopy(notice)
@@ -634,6 +757,7 @@ class ControlService:
     def _maintain(self):
         while not self.closed.wait(1):
             try:
+                self._retry_cleanup_jobs()
                 with self.lock:
                     should_invite = self.topic and any(
                         r["agent_id"] and not r["admin_joined"] and time.monotonic() - self.last_invite.get(i, 0) > 5
@@ -675,6 +799,9 @@ class ControlService:
     def snapshot(self):
         with self.lock:
             profiles = [{**p, "runtime": deepcopy(self.runtime[p["id"]])} for p in self.data["profiles"]]
+            for profile in profiles:
+                if job := self._cleanup_job("profile", profile["id"]):
+                    profile["runtime"].update(cleanup_pending=True, cleanup_error=job.get("error"))
             topics = {t["topic_id"]: t for t in self.history.topics()}
             for topic in self.topic_cache:
                 previous = topics.get(topic["topic_id"], {})
@@ -702,6 +829,9 @@ class ControlService:
                     "admin": {"agent_id": self.comm.agent_id, "endpoint": self.comm.endpoint, "topic": deepcopy(self.topic)},
                     "hosts": deepcopy(self.data["hosts"]), "profiles": profiles, "topics": list(topics.values()),
                     "history_recovery": deepcopy(self.history_recovery),
+                    "history_revision": self.history.revision(),
+                    "cleanup_jobs": deepcopy(self.data["cleanup_jobs"]),
+                    "deleted_profile_ids": list(self.data["deleted_profile_ids"]),
                     "deleted_topic_ids": sorted(deleted),
                     "topic_deletions": [self._topic_deletion_state(t) for t in self.data["deleted_topics"]],
                     "notices": deepcopy(list(reversed(self.data["notices"]))), "events": deepcopy(list(self.events))}

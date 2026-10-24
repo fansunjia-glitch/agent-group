@@ -70,7 +70,7 @@
   function profileName(id) { return data?.profiles.find(profile => profile.id === id)?.name || id || '控制服务'; }
   function isBusy(key) { return busy.has(key) || !connected; }
   function canStartProfile(profile) {
-    return !!profile && !runningStates.has(profile.runtime?.state) && !profile.runtime?.pid && !busy.has(`profile:${profile.id}`);
+    return !!profile && !profile.runtime?.cleanup_pending && !runningStates.has(profile.runtime?.state) && !profile.runtime?.pid && !busy.has(`profile:${profile.id}`);
   }
   function reconcileAgentSelection() {
     for (const id of ui.selectedAgents) {
@@ -210,8 +210,19 @@
         if (sequence < appliedSequence) return;
         if (!result || !Array.isArray(result.profiles) || !Array.isArray(result.hosts)) throw new Error('控制服务状态结构不完整。');
         appliedSequence = sequence;
+        // A deletion can remove an author's messages from a shared topic, so
+        // invalidate every page/search, not only the deleted topic's cache.
+        const historyChanged = (data?.history_revision ?? 0) !== (result.history_revision ?? 0);
+        if (historyChanged) {
+          chatHistories.clear(); observedTopics.clear(); ui.chatScroll.clear(); ui.expandedEvents.clear();
+        }
         data = { ...result, topics: result.topics || [], notices: result.notices || [], events: result.events || [], admin: result.admin || {} };
         const deletedTopicIds = new Set(result.deleted_topic_ids || []);
+        const deletedProfileIds = new Set(result.deleted_profile_ids || []);
+        for (const id of deletedTopicIds) observedTopics.delete(id);
+        for (const [key, history] of chatHistories) if (deletedTopicIds.has(history.topicId)) chatHistories.delete(key);
+        if (deletedProfileIds.has(ui.traceProfile)) ui.traceProfile = '';
+        data.events = data.events.filter(event => !deletedTopicIds.has(event.topic_id) && !deletedProfileIds.has(event.profile_id));
         data.topics = data.topics.filter(topic => !deletedTopicIds.has(topic.topic_id));
         data.topics.forEach(topic => observedTopics.set(topic.topic_id, topic));
         const liveTopicIds = new Set(data.topics.map(topic => topic.topic_id));
@@ -225,7 +236,7 @@
         connected = true;
         lastSuccess = Date.now();
         updateChrome();
-        renderPage(true);
+        renderPage(!historyChanged);
         if (ui.page === 'topics' && ui.id) refreshTopicHistory();
       } catch (error) {
         if (sequence < appliedSequence) return;
@@ -255,7 +266,7 @@
     const active = runningStates.has(runtime.state);
     const pending = busy.has(`profile:${profile.id}`);
     const canStart = canStartProfile(profile);
-    return `${button(icon('edit') + ' 编辑', 'edit-profile', profile.id, 'secondary', active || pending || !connected)}${active ? button(icon('stop') + (runtime.state === 'stopping' ? '停止中' : '停止'), 'stop-profile', profile.id, 'secondary', runtime.state === 'stopping' || pending || !connected) : button(icon('play') + (pending ? '处理中' : '启动'), 'start-profile', profile.id, 'primary', !canStart || !connected)}${runtime.state === 'failed' && runtime.pid ? button(icon('stop') + ' 停止', 'stop-profile', profile.id, 'secondary', pending || !connected) : ''}${button(icon('trash') + ' 删除', 'delete-profile', profile.id, 'danger', active || !!runtime.pid || pending || !connected)}`;
+    return `${button(icon('edit') + ' 编辑', 'edit-profile', profile.id, 'secondary', active || pending || runtime.cleanup_pending || !connected)}${active ? button(icon('stop') + (runtime.state === 'stopping' ? '停止中' : '停止'), 'stop-profile', profile.id, 'secondary', runtime.state === 'stopping' || pending || !connected) : button(icon('play') + (runtime.cleanup_pending ? '清理中' : pending ? '处理中' : '启动'), 'start-profile', profile.id, 'primary', !canStart || !connected)}${runtime.state === 'failed' && runtime.pid ? button(icon('stop') + ' 停止', 'stop-profile', profile.id, 'secondary', pending || !connected) : ''}${button(icon('trash') + (runtime.cleanup_pending ? '重试清理' : ' 删除'), 'delete-profile', profile.id, 'danger', active || !!runtime.pid || pending || !connected)}`;
   }
   function renderOverview() {
     const profiles = data.profiles;
@@ -385,6 +396,12 @@
         if (history.query) params.set('q', history.query);
         if (!initial) params.set(mode === 'older' ? 'before' : 'after', String(mode === 'older' ? history.before : history.newest));
         const result = await request(`/api/topics/${encodeURIComponent(history.topicId)}/messages?${params}`);
+        // Requests started before a purge must never repopulate a new cache.
+        if (chatHistories.get(history.key) !== history) return;
+        if (result.history_revision !== undefined && data.history_revision !== undefined && result.history_revision !== data.history_revision) {
+          if (result.history_revision > data.history_revision) await loadState(true);
+          return;
+        }
         if (!Array.isArray(result.messages)) throw new Error('历史记录响应不完整，请重试。');
         const messages = new Map(history.messages.map(message => [message.key, message]));
         result.messages.forEach(message => messages.set(message.key, message));
@@ -401,7 +418,7 @@
     } catch (error) { history.error = olderError || error.message; }
     finally {
       history.loading = false;
-      if (ui.page === 'topics' && ui.id === history.topicId && ui.chatQuery.trim() === history.query) renderPage();
+      if (chatHistories.get(history.key) === history && ui.page === 'topics' && ui.id === history.topicId && ui.chatQuery.trim() === history.query) renderPage();
     }
   }
   function renderHistoryControls(history) {
@@ -446,6 +463,11 @@
     const pending = (data.topic_deletions || []).filter(item => item.pending_profiles?.length);
     if (!pending.length) return '';
     return `<section class="panel topic-deletion-status" aria-label="话题删除同步状态"><h2>${icon('refresh')}正在同步话题退出</h2>${pending.map(item => `<div><strong>${escapeHTML(item.name || observedTopics.get(item.topic_id)?.name || item.topic_id.slice(0, 12))}</strong><p>等待 ${item.pending_profiles.map(id => escapeHTML(profileName(id))).join('、')} 确认退出；控制台会自动重试。</p>${item.errors && Object.values(item.errors).length ? `<small>${escapeHTML(Object.values(item.errors).join('；'))}</small>` : ''}</div>`).join('')}</section>`;
+  }
+  function renderCleanupStatus() {
+    const jobs = data.cleanup_jobs || [];
+    if (!jobs.length) return '';
+    return `<section class="panel topic-deletion-status" aria-label="级联清理状态" role="status"><h2>${icon('refresh')}关联数据正在清理</h2>${jobs.map(job => `<div><strong>${escapeHTML(job.name || job.id)}</strong><p>${job.kind === 'profile' ? 'Agent' : 'Topic'} 删除尚未完成，控制台会自动重试；重启服务后也会继续。</p>${job.error ? `<small>${escapeHTML(job.error)}</small>` : ''}</div>`).join('')}</section>`;
   }
   function renderTopics() {
     if (ui.id) return renderTopicDetail();
@@ -591,7 +613,7 @@
       const applied = receipt.status === 'applied';
       return `<tr>${cell('Agent', link(target.name, 'agents', target.profile_id))}${cell('运行主机', escapeHTML(hostName(target.host_id)))}${cell('接收', `<span class="${received ? 'state-ok' : 'state-wait'}">${received ? '已接收' : '待确认'}</span>${receipt.received_at ? `<div class="cell-sub">${escapeHTML(timestamp(receipt.received_at))}</div>` : ''}`)}${cell('应用', `<span class="${applied ? 'state-ok' : 'state-wait'}">${applied ? '已应用' : '待检查点'}</span>${receipt.applied_at ? `<div class="cell-sub">${escapeHTML(timestamp(receipt.applied_at))}</div>` : ''}`)}</tr>`;
     }).join('');
-    return `${back('notices', '返回通知历史')}<div class="section-toolbar"><div><h2>通知详情</h2>${badge(notice.id)}</div><div class="notice-row-actions">${button(icon('refresh') + ' 重试未确认', 'retry-notice', notice.id, 'secondary', isBusy(`notice:${notice.id}`) || (stats.total > 0 && stats.applied === stats.total && !notice.publish_error))}${button(icon('trash') + ' 删除记录', 'delete-notice', notice.id, 'danger', isBusy(`notice:${notice.id}`))}</div></div><div class="panel"><div class="notice-content">${escapeHTML(notice.content)}</div><div class="receipt-summary"><span><strong>${stats.total}</strong>固定目标</span><span><strong>${stats.received}</strong>已接收</span><span><strong>${stats.applied}</strong>已应用</span><span>创建于 ${escapeHTML(timestamp(notice.created_at, true))}</span></div></div>${notice.publish_error ? `<div class="spaced">${errorNote(notice.publish_error)}</div>` : ''}<p class="page-note">发布尝试：${escapeHTML(typeof notice.attempts === 'number' ? notice.attempts : (notice.attempts?.length ?? '—'))} 次 · Topic ${escapeHTML(notice.topic_id || '—')}</p><div class="section-toolbar spaced"><strong>逐 Agent 回执</strong><small>成员快照在发送时固定</small></div>${rows ? table(['Agent', '运行主机', '已接收', '已应用'], rows) : empty('本次通知没有目标成员', '先启动并邀请 Agent，再创建新的全体通知。', '', true)}<div class="spaced">${infoNote('“已接收”表示运行时已收信；“已应用”表示已在安全检查点纳入执行上下文。发布成功不等于每个成员已经接收。')}</div>`;
+    return `${back('notices', '返回通知历史')}<div class="section-toolbar"><div><h2>通知详情</h2>${badge(notice.id)}</div><div class="notice-row-actions">${button(icon('refresh') + ' 重试未确认', 'retry-notice', notice.id, 'secondary', isBusy(`notice:${notice.id}`) || (stats.total > 0 && stats.applied === stats.total && !notice.publish_error))}${button(icon('trash') + ' 删除记录', 'delete-notice', notice.id, 'danger', isBusy(`notice:${notice.id}`))}</div></div><div class="panel"><div class="notice-content">${escapeHTML(notice.content)}</div><div class="receipt-summary"><span><strong>${stats.total}</strong>保留目标</span><span><strong>${stats.received}</strong>已接收</span><span><strong>${stats.applied}</strong>已应用</span><span>创建于 ${escapeHTML(timestamp(notice.created_at, true))}</span></div></div>${notice.publish_error ? `<div class="spaced">${errorNote(notice.publish_error)}</div>` : ''}<p class="page-note">发布尝试：${escapeHTML(typeof notice.attempts === 'number' ? notice.attempts : (notice.attempts?.length ?? '—'))} 次 · Topic ${escapeHTML(notice.topic_id || '—')}</p><div class="section-toolbar spaced"><strong>逐 Agent 回执</strong><small>发送时固定成员；删除 Agent 会移除其关联</small></div>${rows ? table(['Agent', '运行主机', '已接收', '已应用'], rows) : empty('本次通知没有目标成员', '先启动并邀请 Agent，再创建新的全体通知。', '', true)}<div class="spaced">${infoNote('“已接收”表示运行时已收信；“已应用”表示已在安全检查点纳入执行上下文。发布成功不等于每个成员已经接收。')}</div>`;
   }
   function checkSummary(check) {
     if (!check) return '<span class="host-check">尚未检查</span>';
@@ -664,7 +686,7 @@
       hosts: button(icon('plus') + ' 添加 SSH 主机', 'new-host', '', 'primary', !connected),
     };
     $('#page-actions').innerHTML = actions[ui.page];
-    $('#page-content').innerHTML = ({ overview: renderOverview, agents: renderAgents, topics: renderTopics, trace: renderTrace, notices: renderNotices, hosts: renderHosts })[ui.page]();
+    $('#page-content').innerHTML = renderCleanupStatus() + ({ overview: renderOverview, agents: renderAgents, topics: renderTopics, trace: renderTrace, notices: renderNotices, hosts: renderHosts })[ui.page]();
     $('#main').classList.toggle('is-chat-page', ui.page === 'topics' && !!ui.id);
     const selectAll = $('#select-all-agents');
     if (selectAll) selectAll.indeterminate = ui.selectedAgents.size > 0 && ui.selectedAgents.size < data.profiles.filter(canStartProfile).length;
@@ -699,6 +721,7 @@
   function openProfile(id = null) {
     if (!data) return toast('请等待控制服务连接。', true);
     const p = data.profiles.find(profile => profile.id === id);
+    if (p?.runtime?.cleanup_pending) return toast('这个 Agent 正在清理关联数据，请等待清理完成。', true);
     if (p && runningStates.has(p.runtime?.state)) return toast('请先停止 Agent，再编辑配置。', true);
     const hosts = data.hosts.map(host => ({ value: host.id, label: `${host.name} · ${host.kind === 'ssh' ? 'SSH' : '本地'}` }));
     if (!hosts.length) return toast('没有可用的运行主机，请先检查控制服务配置。', true);
@@ -709,15 +732,15 @@
     const profile = data?.profiles.find(item => item.id === id);
     if (!profile) return toast('这个 Agent 配置已不存在，请刷新列表。', true);
     if (runningStates.has(profile.runtime?.state) || profile.runtime?.pid) return toast('请先停止 Agent，再删除配置。', true);
-    const body = `<div class="field full"><p>将删除 <strong>${escapeHTML(profile.name)}</strong> 的人设配置，并从受管 Agent 列表中移除。</p></div><div class="field full">${infoNote('保留工作目录、历史与记忆，以及已有通知的成员快照和回执。')}</div><div class="field full"><small>运行中的 Agent 必须先停止。删除后如需再次运行，需要重新创建配置。</small></div>`;
-    openForm('delete-profile', '删除 Agent 配置', body, '确认删除配置', id);
+    const body = `<div class="field full"><p>删除 <strong>${escapeHTML(profile.name)}</strong> 及其关联数据？</p></div><div class="field full">${infoNote('将清理人设配置、本机工作目录（历史、记忆、定时任务和生成文件）、运行日志、该 Agent 的聊天与执行记录，以及通知目标和回执。此操作不可恢复。', true)}</div><div class="field full"><small>共享 Topic 和其他成员的记录保留。离线也会清理；运行中的 Agent 必须先停止。远程工作目录无法确认清理时，会明确提示原因。</small></div>`;
+    openForm('delete-profile', '删除 Agent 及关联数据', body, '确认删除', id);
     $('#form-submit').className = 'button danger';
   }
   function openDeleteTopic(id) {
     const topic = data?.topics.find(item => item.topic_id === id);
     if (!topic) return toast('这个 Topic 已不存在，请刷新列表。', true);
     if (!canDeleteTopic(topic)) return toast(topic.delete_reason || '管理员频道用于全体通知，暂不支持删除。', true);
-    const body = `<div class="field full"><p>删除 <strong># ${escapeHTML(topic.name)}</strong>？该话题将从 Topics 列表中移除，平台管理的 Agent 会退出，之后也不能重新加入这个话题 ID。</p></div><div class="field full">${infoNote('历史消息对应的执行事件仍保留，可在“执行事件”页面查看。删除话题不会删除 Agent、人设或长期记忆。')}</div><div class="field full"><small>运行中的成员会通过控制通道退出；离线成员下次启动时同步。其他独立运行、未受本平台管理的节点不受此操作控制。</small></div>`;
+    const body = `<div class="field full"><p>删除 <strong># ${escapeHTML(topic.name)}</strong> 及其关联数据？平台管理的 Agent 会退出，之后也不能重新加入这个话题 ID。</p></div><div class="field full">${infoNote('将清理平台保存的该话题聊天、执行记录、成员关系，以及关联通知和回执。此操作不可恢复。', true)}</div><div class="field full"><small>运行中的成员会退出并丢弃未读消息；离线成员下次启动前同步。保留 Agent 人设、已形成的记忆和其他话题。独立运行、未受平台管理的节点不受此操作控制。</small></div>`;
     openForm('delete-topic', '删除 Topic', body, '确认删除话题', id);
     $('#form-submit').className = 'button danger';
   }
@@ -786,8 +809,8 @@
       path = '/api/hosts'; payload = { name: value('name'), kind: 'ssh', ssh_target: value('ssh_target'), port, repo_path: value('repo_path'), python_path: value('python_path'), workspace_root: value('workspace_root'), comm_host: value('comm_host') }; success = 'SSH 主机已添加，可继续检查连接。';
     }
     if (kind === 'profile') { path = `/api/profiles${ui.editingId ? `/${encodeURIComponent(ui.editingId)}` : ''}`; method = ui.editingId ? 'PUT' : 'POST'; payload = { name: value('name'), persona: value('persona'), initial_prompt: value('initial_prompt'), base_url: value('base_url'), model: value('model'), host_id: value('host_id'), enable_memory: fields.has('enable_memory'), thinking: fields.has('thinking') }; success = ui.editingId ? 'Agent 配置已保存。' : 'Agent 配置已创建。'; }
-    if (kind === 'delete-profile') { path = `/api/profiles/${encodeURIComponent(ui.editingId)}`; method = 'DELETE'; payload = {}; success = 'Agent 配置已删除，工作目录、历史和通知回执已保留。'; }
-    if (kind === 'delete-topic') { path = `/api/topics/${encodeURIComponent(ui.editingId)}`; method = 'DELETE'; payload = {}; success = '话题已从列表移除，历史执行事件已保留。'; }
+    if (kind === 'delete-profile') { path = `/api/profiles/${encodeURIComponent(ui.editingId)}`; method = 'DELETE'; payload = {}; success = 'Agent 及其关联数据已删除。'; }
+    if (kind === 'delete-topic') { path = `/api/topics/${encodeURIComponent(ui.editingId)}`; method = 'DELETE'; payload = {}; success = '话题及其关联记录已删除。'; }
     if (kind === 'topic') { path = '/api/admin/topic'; payload = { name: value('name'), description: value('description') }; success = '管理员 Topic 已创建。'; }
     if (kind === 'delete-notice') { path = `/api/notices/${encodeURIComponent(ui.editingId)}`; method = 'DELETE'; payload = {}; success = '通知记录已删除，已送达的内容不会撤回。'; }
     if (kind === 'notice') { path = '/api/notices'; payload = { content: value('content') }; success = '通知已提交，正在等待逐 Agent 回执。'; }
@@ -807,13 +830,14 @@
       if (kind === 'topic' || kind === 'delete-notice') location.hash = '#notices';
       if (kind === 'delete-topic') {
         location.hash = '#topics';
-        if (result?.pending_profiles?.length) success = `删除已登记，正在等待 ${result.pending_profiles.length} 个 Agent 确认退出。`;
+        if (result?.pending_profiles?.length) success = `话题关联记录已清理，正在等待 ${result.pending_profiles.length} 个 Agent 确认退出。`;
       }
+      if (result?.cleanup_pending) success = `删除已登记，关联数据尚未清理完成，控制台会自动重试。${result.cleanup_error || ''}`;
       if (kind === 'notice') {
         const id = result?.id || result?.notice?.id;
         location.hash = id ? `#notices/${encodeURIComponent(id)}` : '#notices';
       }
-      toast(success);
+      toast(success, !!result?.cleanup_pending);
     } catch (error) { showFormError(error.message); }
     finally { if (dialog.open) { form.querySelectorAll('button').forEach(element => { element.disabled = false; }); submit.textContent = oldLabel; } }
   }
@@ -829,6 +853,7 @@
       renderPage(); return;
     }
     if (['start-profile', 'stop-profile', 'edit-profile', 'delete-profile'].includes(action) && busy.has(`profile:${id}`)) return;
+    if (['start-profile', 'edit-profile'].includes(action) && data?.profiles.find(p => p.id === id)?.runtime?.cleanup_pending) return toast('这个 Agent 正在清理关联数据，请等待清理完成。', true);
     if (action === 'chat-messages' || action === 'chat-events') { ui.chatTab = action === 'chat-messages' ? 'messages' : 'events'; renderPage(); return; }
     if (action === 'toggle-chat-members') { ui.chatMembers = !ui.chatMembers; renderPage(); return; }
     if (action === 'chat-latest') { const stream = $('#chat-stream'); if (stream) stream.scrollTop = stream.scrollHeight; updateChatJump(); return; }

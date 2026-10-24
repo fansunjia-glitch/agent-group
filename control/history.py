@@ -6,6 +6,41 @@ import sqlite3
 from threading import RLock
 
 
+def _event_topic_ids(event):
+    """Read protocol fields only, never search human/model message text."""
+    if not isinstance(event, dict):
+        return set()
+    identifiers = set()
+
+    def collect(value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return
+        rows = value if isinstance(value, list) else [value]
+        for row in rows:
+            if isinstance(row, dict) and isinstance(row.get("topic_id"), str):
+                identifiers.add(row["topic_id"])
+
+    collect(event)
+    if event.get("type") in ("tool_started", "tool_finished"):
+        for field in ("args", "arguments", "result"):
+            collect(event.get(field))
+        # create_topic returns its identifier directly, unlike discover_topics'
+        # JSON array. Exact equality is intentional; free-text matches are not.
+        if (event.get("tool_name", event.get("name")) == "create_topic"
+                and event.get("type") == "tool_finished"
+                and isinstance(event.get("result"), str)):
+            identifiers.add(event["result"])
+    return identifiers
+
+
+def event_references_topic(event, topic_id):
+    """Shared cascade predicate for the archive, live deque and JSONL logs."""
+    return topic_id in _event_topic_ids(event)
+
+
 class TopicHistory:
     def __init__(self, path):
         self.path = Path(path)
@@ -33,14 +68,100 @@ class TopicHistory:
             );
             CREATE INDEX IF NOT EXISTS messages_topic_seq ON messages(topic_id, seq);
             CREATE TABLE IF NOT EXISTS imports (path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS deleted_profiles (profile_id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS deleted_topics (topic_id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS history_metadata (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO history_metadata VALUES(1,0);
         """)
+        # Older archives stored the author only inside raw JSON. Backfill an
+        # indexed column once so profile cleanup includes non-message events.
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(events)")}
+        with self.db:
+            # sqlite3's legacy mode does not begin transactions for DDL. Keep
+            # the column addition and full backfill atomic across interruptions.
+            self.db.execute("BEGIN")
+            if "profile_id" not in columns:
+                self.db.execute("ALTER TABLE events ADD COLUMN profile_id TEXT")
+                for row in self.db.execute("SELECT event_id,raw FROM events").fetchall():
+                    try:
+                        profile_id = json.loads(row["raw"]).get("profile_id")
+                    except (ValueError, AttributeError):
+                        continue
+                    if isinstance(profile_id, str):
+                        self.db.execute("UPDATE events SET profile_id=? WHERE event_id=?",
+                                        (profile_id, row["event_id"]))
+            self.db.execute("CREATE INDEX IF NOT EXISTS events_profile ON events(profile_id)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS messages_profile ON messages(profile_id)")
 
     def close(self):
         with self.lock:
             self.db.close()
 
+    def revision(self):
+        """Durable cache generation; only destructive history changes bump it."""
+        with self.lock:
+            return self.db.execute("SELECT revision FROM history_metadata WHERE singleton=1").fetchone()[0]
+
+    def _deleted_profile(self, identifier):
+        return isinstance(identifier, str) and self.db.execute(
+            "SELECT 1 FROM deleted_profiles WHERE profile_id=?", (identifier,)).fetchone() is not None
+
+    def _deleted_topic(self, identifier):
+        return isinstance(identifier, str) and self.db.execute(
+            "SELECT 1 FROM deleted_topics WHERE topic_id=?", (identifier,)).fetchone() is not None
+
+    @staticmethod
+    def _validate_deletion_id(identifier):
+        if not isinstance(identifier, str) or not identifier.strip():
+            raise ValueError("Deletion ID must be a non-empty string")
+
+    def delete_profile(self, identifier):
+        """Purge this profile's records without altering shared conversations.
+
+        The durable tombstone also rejects late worker events and old JSONL
+        imports. Other participants' messages and topic metadata remain intact.
+        """
+        self._validate_deletion_id(identifier)
+        with self.lock, self.db:
+            created = self.db.execute("INSERT OR IGNORE INTO deleted_profiles VALUES(?)", (identifier,)).rowcount
+            messages = self.db.execute("DELETE FROM messages WHERE profile_id=?", (identifier,)).rowcount
+            events = self.db.execute("DELETE FROM events WHERE profile_id=?", (identifier,)).rowcount
+            if created or messages or events:
+                self.db.execute("UPDATE history_metadata SET revision=revision+1 WHERE singleton=1")
+            revision = self.revision()
+        return {"deleted_profile": identifier, "messages_deleted": messages,
+                "events_deleted": events, "topics_deleted": 0, "history_revision": revision}
+
+    def delete_topic(self, identifier):
+        """Purge a topic's archive and prevent stale discovery from reviving it."""
+        self._validate_deletion_id(identifier)
+        with self.lock, self.db:
+            created = self.db.execute("INSERT OR IGNORE INTO deleted_topics VALUES(?)", (identifier,)).rowcount
+            messages = self.db.execute("DELETE FROM messages WHERE topic_id=?", (identifier,)).rowcount
+            events = self.db.execute("DELETE FROM events WHERE topic_id=?", (identifier,)).rowcount
+            # Tool trace records can carry their topic only inside structured
+            # arguments/results, so the indexed top-level predicate is not enough.
+            nested_ids = []
+            for row in self.db.execute("SELECT event_id,raw FROM events"):
+                try:
+                    event = json.loads(row["raw"])
+                except ValueError:
+                    continue
+                if event_references_topic(event, identifier):
+                    nested_ids.append((row["event_id"],))
+            self.db.executemany("DELETE FROM events WHERE event_id=?", nested_ids)
+            events += len(nested_ids)
+            topics = self.db.execute("DELETE FROM topics WHERE topic_id=?", (identifier,)).rowcount
+            if created or messages or events or topics:
+                self.db.execute("UPDATE history_metadata SET revision=revision+1 WHERE singleton=1")
+            revision = self.revision()
+        return {"deleted_topic": identifier, "messages_deleted": messages,
+                "events_deleted": events, "topics_deleted": topics, "history_revision": revision}
+
     def _remember_topic(self, topic_id, name=None, description=None):
-        if not isinstance(topic_id, str) or not topic_id:
+        if not isinstance(topic_id, str) or not topic_id or self._deleted_topic(topic_id):
             return
         name = name if isinstance(name, str) and name.strip() else ""
         description = description if isinstance(description, str) else ""
@@ -59,10 +180,14 @@ class TopicHistory:
         if not isinstance(event, dict) or not isinstance(event.get("id"), str):
             return
         topic_id = event.get("topic_id")
+        if self._deleted_profile(event.get("profile_id")) or any(
+                self._deleted_topic(identifier) for identifier in _event_topic_ids(event)):
+            return
         kind = event.get("type", "event")
         raw = json.dumps(event, ensure_ascii=False)
-        cursor = self.db.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?)",
-                                (event["id"], str(event.get("ts", "")), topic_id, kind, raw))
+        cursor = self.db.execute("""INSERT OR IGNORE INTO events
+            (event_id,ts,topic_id,kind,raw,profile_id) VALUES(?,?,?,?,?,?)""",
+            (event["id"], str(event.get("ts", "")), topic_id, kind, raw, event.get("profile_id")))
         if topic_id:
             self._remember_topic(topic_id, event.get("topic_name"), event.get("description"))
         if kind != "message_sent" or not isinstance(topic_id, str) or not isinstance(event.get("payload"), str):
@@ -87,6 +212,8 @@ class TopicHistory:
 
     def _add_notice(self, notice):
         if not isinstance(notice, dict) or not notice.get("id") or not notice.get("topic_id"):
+            return
+        if self._deleted_topic(notice["topic_id"]):
             return
         self._remember_topic(notice["topic_id"])
         self.db.execute("""INSERT OR IGNORE INTO messages
@@ -195,7 +322,9 @@ class TopicHistory:
             rows = rows[:limit]
             if after is None:
                 rows.reverse()
+            revision = self.revision()
         messages = [self._message(row) for row in rows]
         return {"messages": messages, "total": total, "has_more": has_more,
                 "next_before": messages[0]["seq"] if messages else None,
-                "latest_cursor": messages[-1]["seq"] if messages else (after or 0)}
+                "latest_cursor": messages[-1]["seq"] if messages else (after or 0),
+                "history_revision": revision}
