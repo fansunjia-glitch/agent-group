@@ -8,12 +8,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
+from unittest.mock import patch
 
 from openai import OpenAI
 
 from agent import Agent
 from agent.identity import resolve_user_id, validate_user_id
 from agent.memory import MemoryStore
+from agent.test.quiet_comm import QuietComm, local_model_network
 
 
 @contextmanager
@@ -65,6 +67,14 @@ def model_capture():
 
 
 class UserIdentityTests(unittest.TestCase):
+    def setUp(self):
+        network = local_model_network()
+        network.start()
+        self.addCleanup(network.stop)
+        communication = patch("agent.agent.Comm", QuietComm)
+        communication.start()
+        self.addCleanup(communication.stop)
+
     def test_profile_identity_is_stable_across_workspace_and_display_name_changes(self):
         with TemporaryDirectory() as directory, model_capture() as (url, _):
             ready = []
@@ -104,7 +114,7 @@ class UserIdentityTests(unittest.TestCase):
     def test_stream_and_every_memory_operation_put_same_user_id_in_http_body(self):
         with TemporaryDirectory() as directory, model_capture() as (url, requests):
             for profile_id, thinking in (('alice_1', True), ('bobe_2', False)):
-                with Agent(api_key='offline', base_url=url, profile_id=profile_id, thinking=thinking,
+                with Agent(api_key='offline', base_url=url, api_mode='deepseek', profile_id=profile_id, thinking=thinking,
                            workdir=Path(directory)/profile_id, host='127.0.0.1') as node:
                     before = len(requests)
                     with redirect_stdout(StringIO()):
@@ -127,8 +137,8 @@ class UserIdentityTests(unittest.TestCase):
     def test_memory_store_alone_uses_same_persistent_workspace_identity(self):
         with TemporaryDirectory() as directory, model_capture() as (url, requests):
             with OpenAI(api_key='offline', base_url=url) as client:
-                first = MemoryStore(Path(directory), client, 'deepseek-flash')
-                second = MemoryStore(Path(directory), client, 'deepseek-flash')
+                first = MemoryStore(Path(directory), client, 'deepseek-flash', api_mode='deepseek')
+                second = MemoryStore(Path(directory), client, 'deepseek-flash', api_mode='deepseek')
                 first.extract_memories([{'role': 'user', 'content': 'A stable preference'}])
                 self.assertEqual(first.user_id, second.user_id)
                 self.assertEqual(requests[0]['user_id'], first.user_id)

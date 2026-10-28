@@ -34,8 +34,8 @@
   const runningStates = new Set(['starting', 'idle', 'working', 'stopping']);
   const activeStates = new Set(['idle', 'working']);
   const stateLabels = { stopped: '已停止', starting: '启动中', idle: '空闲', working: '执行中', stopping: '停止中', failed: '异常' };
-  const pageNames = { overview: '协作概览', agents: 'Agents', topics: 'Topics', trace: '执行事件', notices: '通知中心', hosts: '运行主机' };
-  const descriptions = { overview: '查看各个 Agent 的当前状态与 Topic 协作关系。', agents: '管理 Agent 人设、启动任务，以及本地和远程运行状态。', topics: '查看协作 Topic、成员和相关事件。', trace: '按 Agent 查看实际产生的执行与通信事件。', notices: '通过管理员 Topic 同步意图，并跟踪每个 Agent 的回执。', hosts: '配置本地与同一局域网内的 SSH 主机，为 Agent 指定运行位置。' };
+  const pageNames = { overview: '协作概览', agents: 'Agents', topics: 'Topics', trace: '执行事件', notices: '通知中心', hosts: '运行主机', models: '模型配置' };
+  const descriptions = { models: '统一管理 OpenAI 兼容接口，让不同 Agent 使用适合的模型。', overview: '查看各个 Agent 的当前状态与 Topic 协作关系。', agents: '管理 Agent 人设、启动任务，以及本地和远程运行状态。', topics: '查看协作 Topic、成员和相关事件。', trace: '按 Agent 查看实际产生的执行与通信事件。', notices: '通过管理员 Topic 同步意图，并跟踪每个 Agent 的回执。', hosts: '配置本地与同一局域网内的 SSH 主机，为 Agent 指定运行位置。' };
   let data = null;
   let connected = false;
   let lastSuccess = 0;
@@ -68,6 +68,8 @@
   }
   function hostName(id) { return data?.hosts.find(host => host.id === id)?.name || id || '未指定'; }
   function profileName(id) { return data?.profiles.find(profile => profile.id === id)?.name || id || '控制服务'; }
+  function providerFor(profile) { return (data?.model_providers || []).find(provider => provider.id === profile?.provider_id); }
+  function modelReady(profile) { return data?.model_providers ? !!providerFor(profile)?.credentials_configured : !!data?.credentials_configured; }
   function isBusy(key) { return busy.has(key) || !connected; }
   function canStartProfile(profile) {
     return !!profile && !profile.runtime?.cleanup_pending && !runningStates.has(profile.runtime?.state) && !profile.runtime?.pid && !busy.has(`profile:${profile.id}`);
@@ -97,7 +99,7 @@
     reconcileAgentSelection();
     const profiles = data.profiles.filter(p => ui.selectedAgents.has(p.id) && canStartProfile(p));
     if (!profiles.length) return toast('请选择至少一个可启动的 Agent。', true);
-    if (!data.credentials_configured) { toast('请先设置 API 凭据，所选 Agent 会保留。'); return openCredentials(); }
+    if (!profiles.some(modelReady)) { toast('所选 Agent 的模型配置尚未设置 API Key，选择已保留。'); return openCredentials(); }
     const batch = { running: true, items: profiles.map(p => ({ id: p.id, name: p.name, status: 'queued', error: '' })) };
     ui.batch = batch;
     // Reserve every selected profile before the first await, including queued
@@ -114,6 +116,7 @@
             ui.selectedAgents.delete(item.id);
             continue;
           }
+          if (!modelReady(profile)) { item.status = 'error'; item.error = '该 Agent 的模型配置尚未设置 API Key。'; continue; }
           item.status = 'submitting'; renderPage();
           const runtime = await request(`/api/profiles/${encodeURIComponent(item.id)}/start`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Control-Token': data.csrf_token }, body: '{}' });
           const current = data.profiles.find(p => p.id === item.id);
@@ -189,7 +192,7 @@
     const stale = connected && Date.now() - lastSuccess > 7000;
     status.className = `connection ${connected ? (stale ? 'stale' : 'online') : 'offline'}`;
     status.innerHTML = `<span class="status-dot"></span>${connected ? (stale ? '状态已过期' : '已连接') : (data ? '连接中断' : '等待连接')}`;
-    $('#credentials-label').textContent = data?.credentials_configured ? 'API 凭据已设置' : '设置 API 凭据';
+    $('#credentials-label').textContent = '模型配置';
     $('#agent-count').textContent = data ? data.profiles.length : '—';
     $('#admin-endpoint').textContent = data?.admin?.endpoint || '等待连接';
     $('#footer-summary').textContent = data ? `${data.profiles.filter(p => activeStates.has(p.runtime?.state)).length} 运行中 · ${data.profiles.length} 个 Agent · ${data.topics.length} 个 Topic` : '等待状态';
@@ -273,7 +276,7 @@
     const topics = data.topics;
     if (!profiles.length) return empty('让第一个 Agent 加入工作区', '创建独立的人设与启动任务，选择本地或 SSH 主机。启动后，在这里查看真实协作关系。', button(icon('plus') + ' 创建 Agent', 'new-profile', '', 'primary') + button('配置运行主机', 'go-hosts'));
     const active = profiles.filter(p => activeStates.has(p.runtime?.state)).length;
-    return `<div class="summary-strip"><div class="summary-stat"><strong>${profiles.length}</strong><span>已登记 Agent</span></div><div class="summary-stat"><strong>${active}</strong><span>运行中</span></div><div class="summary-stat"><strong>${topics.length}</strong><span>协作 Topic</span></div></div>${window.AgentTopology.render(data, { escapeHTML, icon, agentAvatar, stateBadge })}${!data.credentials_configured ? `<div class="spaced">${infoNote('启动前请在顶部设置 API 凭据。凭据只保留在控制服务进程内存中。', true)}</div>` : ''}<div class="section-toolbar spaced"><strong>最近事件</strong>${link('查看全部 →', 'trace')}</div>${eventList(sortedEvents().slice(0, 4))}`;
+    return `<div class="summary-strip"><div class="summary-stat"><strong>${profiles.length}</strong><span>已登记 Agent</span></div><div class="summary-stat"><strong>${active}</strong><span>运行中</span></div><div class="summary-stat"><strong>${topics.length}</strong><span>协作 Topic</span></div></div>${window.AgentTopology.render(data, { escapeHTML, icon, agentAvatar, stateBadge })}${!data.profiles.every(modelReady) ? `<div class="spaced">${infoNote('部分 Agent 的模型配置尚未设置 API Key，请前往“模型配置”补充。', true)}</div>` : ''}<div class="section-toolbar spaced"><strong>最近事件</strong>${link('查看全部 →', 'trace')}</div>${eventList(sortedEvents().slice(0, 4))}`;
   }
   function agentTone(name) {
     // An initial keeps a person's color stable across pages and restarts.
@@ -366,7 +369,7 @@
     const received = events.filter(event => event.type === 'message_received').length;
     const lastSeen = r.last_seen ? timestamp(r.last_seen) : '尚未运行';
     const personaId = `agent-persona-${p.id}`, runtimeId = `agent-runtime-${p.id}`;
-    return `${back('agents', '返回 Agent 列表')}<div class="agent-profile-hero agent-tone-${agentTone(p.name)}"><div class="agent-profile-person">${agentAvatar(p, 'xl')}<div><span class="agent-role-label">${escapeHTML(agentRole(p))}</span><h2>${escapeHTML(p.name)}</h2><div class="agent-profile-status">${stateBadge(p)}<span>${icon('server')}${escapeHTML(hostName(p.host_id))}</span><span>${escapeHTML(p.model || '未设置模型')}</span></div></div></div><div class="agent-profile-actions">${profileActions(p)}</div><div class="agent-profile-quote"><span>${icon('info')}</span><p>${escapeHTML(agentPersonaExcerpt(p))}</p></div></div>${r.error ? `<div class="spaced">${errorNote(r.error)}</div>` : ''}<div class="agent-detail-metrics"><div><span>${icon('hash')}</span><strong>${joined.length}</strong><p>已加入话题</p></div><div><span>${icon('send')}</span><strong>${sent}</strong><p>窗口内发出</p></div><div><span>${icon('radio')}</span><strong>${received}</strong><p>窗口内接收</p></div><div><span>${icon('trace')}</span><strong class="agent-metric-time">${escapeHTML(lastSeen)}</strong><p>最近心跳 / 事件</p></div></div><div class="agent-detail-grid"><section class="panel agent-relationship-panel"><div class="panel-header"><div><h2>参与的对话</h2><small>Agent 与 Topic 的实际关系</small></div>${badge(`${joined.length} 个话题`, 'blue')}</div><div class="agent-map-wrap">${agentTopicMap(p, joined)}</div></section><section class="panel agent-activity-panel"><div class="panel-header"><h2>近期活动分布</h2>${icon('trace')}</div><div class="panel-body">${agentActivityMix(events)}<div class="agent-admin-membership">${icon(r.admin_joined ? 'check' : 'radio')}<div><strong>${r.admin_joined ? '已加入管理员频道' : '尚未加入管理员频道'}</strong><p>${r.admin_joined ? '管理员通知可由运行时接收。' : r.invite_error ? escapeHTML(r.invite_error) : '启动并完成邀请后可接收管理员通知。'}</p></div></div></div></section></div>${lastMessage ? `<section class="panel agent-detail-message"><span class="agent-detail-message-icon">${icon('send')}</span><div><div class="agent-last-heading"><strong>最近发言</strong><time>${escapeHTML(timestamp(lastMessage.ts, true))}</time></div><p>${escapeHTML(lastMessage.payload || '')}</p>${link('打开这段对话 →', 'topics', lastMessage.topic_id, 'agent-detail-link')}</div></section>` : ''}<div class="agent-detail-folds"><details class="panel agent-fold" data-event-id="${attr(personaId)}"${ui.expandedEvents.has(personaId) ? ' open' : ''}><summary><span>${icon('agents')}人设与启动安排</span><small>查看完整配置</small></summary><div class="panel-body"><section class="detail-section"><h3>完整人设</h3><p class="pre-wrap">${escapeHTML(p.persona || '未设置')}</p></section><section class="detail-section"><h3>启动任务</h3><p class="pre-wrap">${escapeHTML(p.initial_prompt || '未设置')}</p></section><section class="detail-section"><h3>模型配置</h3><dl class="facts"><dt>API 地址</dt><dd>${escapeHTML(p.base_url)}</dd><dt>长期记忆</dt><dd>${p.enable_memory ? '启用' : '关闭'}</dd><dt>思考模式</dt><dd>${p.thinking ? '启用' : '关闭'}</dd></dl></section></div></details><details class="panel agent-fold" data-event-id="${attr(runtimeId)}"${ui.expandedEvents.has(runtimeId) ? ' open' : ''}><summary><span>${icon('terminal')}运行与连接信息</span><small>PID / ID / 地址</small></summary><div class="panel-body"><dl class="facts"><dt>配置 ID</dt><dd class="mono">${escapeHTML(p.id)}</dd><dt>模型 User ID</dt><dd class="mono">${escapeHTML(p.user_id || `agent_${p.id}`)}<div class="cell-sub">用于请求身份与缓存隔离。</div></dd><dt>运行主机</dt><dd>${escapeHTML(hostName(p.host_id))}</dd><dt>进程 PID</dt><dd class="mono">${escapeHTML(r.pid || '—')}</dd><dt>Agent ID</dt><dd class="mono">${escapeHTML(r.agent_id || '—')}</dd><dt>通信地址</dt><dd class="mono">${escapeHTML(r.endpoint || '—')}</dd><dt>Run ID</dt><dd class="mono">${escapeHTML(r.run_id || '—')}</dd><dt>最后事件</dt><dd>${escapeHTML(timestamp(r.last_seen, true))}</dd></dl></div></details></div><div class="section-toolbar spaced"><strong>活动时间线</strong>${button('查看全部事件 ' + icon('arrow'), 'trace-agent', p.id, 'ghost')}</div>${eventList(sortedEvents(event => event.profile_id === p.id).slice(0, 12))}`;
+    return `${back('agents', '返回 Agent 列表')}<div class="agent-profile-hero agent-tone-${agentTone(p.name)}"><div class="agent-profile-person">${agentAvatar(p, 'xl')}<div><span class="agent-role-label">${escapeHTML(agentRole(p))}</span><h2>${escapeHTML(p.name)}</h2><div class="agent-profile-status">${stateBadge(p)}<span>${icon('server')}${escapeHTML(hostName(p.host_id))}</span><span>${escapeHTML(p.model || '未设置模型')}</span></div></div></div><div class="agent-profile-actions">${profileActions(p)}</div><div class="agent-profile-quote"><span>${icon('info')}</span><p>${escapeHTML(agentPersonaExcerpt(p))}</p></div></div>${r.error ? `<div class="spaced">${errorNote(r.error)}</div>` : ''}<div class="agent-detail-metrics"><div><span>${icon('hash')}</span><strong>${joined.length}</strong><p>已加入话题</p></div><div><span>${icon('send')}</span><strong>${sent}</strong><p>窗口内发出</p></div><div><span>${icon('radio')}</span><strong>${received}</strong><p>窗口内接收</p></div><div><span>${icon('trace')}</span><strong class="agent-metric-time">${escapeHTML(lastSeen)}</strong><p>最近心跳 / 事件</p></div></div><div class="agent-detail-grid"><section class="panel agent-relationship-panel"><div class="panel-header"><div><h2>参与的对话</h2><small>Agent 与 Topic 的实际关系</small></div>${badge(`${joined.length} 个话题`, 'blue')}</div><div class="agent-map-wrap">${agentTopicMap(p, joined)}</div></section><section class="panel agent-activity-panel"><div class="panel-header"><h2>近期活动分布</h2>${icon('trace')}</div><div class="panel-body">${agentActivityMix(events)}<div class="agent-admin-membership">${icon(r.admin_joined ? 'check' : 'radio')}<div><strong>${r.admin_joined ? '已加入管理员频道' : '尚未加入管理员频道'}</strong><p>${r.admin_joined ? '管理员通知可由运行时接收。' : r.invite_error ? escapeHTML(r.invite_error) : '启动并完成邀请后可接收管理员通知。'}</p></div></div></div></section></div>${lastMessage ? `<section class="panel agent-detail-message"><span class="agent-detail-message-icon">${icon('send')}</span><div><div class="agent-last-heading"><strong>最近发言</strong><time>${escapeHTML(timestamp(lastMessage.ts, true))}</time></div><p>${escapeHTML(lastMessage.payload || '')}</p>${link('打开这段对话 →', 'topics', lastMessage.topic_id, 'agent-detail-link')}</div></section>` : ''}<div class="agent-detail-folds"><details class="panel agent-fold" data-event-id="${attr(personaId)}"${ui.expandedEvents.has(personaId) ? ' open' : ''}><summary><span>${icon('agents')}人设与启动安排</span><small>查看完整配置</small></summary><div class="panel-body"><section class="detail-section"><h3>完整人设</h3><p class="pre-wrap">${escapeHTML(p.persona || '未设置')}</p></section><section class="detail-section"><h3>启动任务</h3><p class="pre-wrap">${escapeHTML(p.initial_prompt || '未设置')}</p></section><section class="detail-section"><h3>模型配置</h3><dl class="facts"><dt>模型配置</dt><dd>${escapeHTML(providerFor(p)?.name || '未选择')} · ${escapeHTML(p.model)}</dd><dt>API 地址</dt><dd>${escapeHTML(p.base_url)}</dd><dt>长期记忆</dt><dd>${p.enable_memory ? '启用' : '关闭'}</dd><dt>思考模式</dt><dd>${providerFor(p)?.api_mode === 'deepseek' ? (p.thinking ? '启用' : '关闭') : '使用模型默认策略'}</dd></dl></section></div></details><details class="panel agent-fold" data-event-id="${attr(runtimeId)}"${ui.expandedEvents.has(runtimeId) ? ' open' : ''}><summary><span>${icon('terminal')}运行与连接信息</span><small>PID / ID / 地址</small></summary><div class="panel-body"><dl class="facts"><dt>配置 ID</dt><dd class="mono">${escapeHTML(p.id)}</dd><dt>模型 User ID</dt><dd class="mono">${escapeHTML(p.user_id || `agent_${p.id}`)}<div class="cell-sub">用于请求身份与缓存隔离。</div></dd><dt>运行主机</dt><dd>${escapeHTML(hostName(p.host_id))}</dd><dt>进程 PID</dt><dd class="mono">${escapeHTML(r.pid || '—')}</dd><dt>Agent ID</dt><dd class="mono">${escapeHTML(r.agent_id || '—')}</dd><dt>通信地址</dt><dd class="mono">${escapeHTML(r.endpoint || '—')}</dd><dt>Run ID</dt><dd class="mono">${escapeHTML(r.run_id || '—')}</dd><dt>最后事件</dt><dd>${escapeHTML(timestamp(r.last_seen, true))}</dd></dl></div></details></div><div class="section-toolbar spaced"><strong>活动时间线</strong>${button('查看全部事件 ' + icon('arrow'), 'trace-agent', p.id, 'ghost')}</div>${eventList(sortedEvents(event => event.profile_id === p.id).slice(0, 12))}`;
   }
   function chatHistory(topicId = ui.id, query = ui.chatQuery.trim()) {
     const key = JSON.stringify([topicId, query]);
@@ -621,6 +624,15 @@
     const ok = result.ok ?? result.success;
     return `<span class="host-check ${ok === true ? 'success' : ok === false ? 'failure' : ''}">${escapeHTML(result.message || result.error || (ok === true ? '连接正常' : ok === false ? '连接失败' : result.status || '已检查'))}</span>${result.ts || result.checked_at ? `<div class="cell-sub">${escapeHTML(timestamp(result.ts || result.checked_at, true))}</div>` : ''}`;
   }
+  function renderProviders() {
+    const providers = data.model_providers || [];
+    const intro = `<div class="provider-intro panel"><span class="provider-symbol">${icon('server')}</span><div><h2>一个接口，连接不同模型</h2><p>填写供应商、Base URL 和模型名称，再为 Agent 选择配置。支持多个供应商并行使用。</p></div>${badge('OpenAI 兼容', 'blue')}</div>`;
+    if (!providers.length) return intro + empty('添加第一个模型配置', '可连接云端供应商、代理网关或本地兼容服务。', button(icon('plus') + ' 添加模型配置', 'new-provider', '', 'primary'));
+    return intro + `<div class="provider-grid">${providers.map(provider => {
+      const profiles = data.profiles.filter(p => p.provider_id === provider.id);
+      return `<article class="panel provider-card"><div class="provider-card-heading"><span class="provider-symbol">${icon('server')}</span><div><h2>${escapeHTML(provider.name)}</h2><small>${provider.api_mode === 'deepseek' ? 'OpenAI 接口 · DeepSeek 扩展' : 'OpenAI 兼容接口'}</small></div>${badge(provider.credentials_configured ? 'Key 已设置' : '待设置 Key', provider.credentials_configured ? 'green' : 'amber')}</div><div class="provider-model"><span>模型</span><strong>${escapeHTML(provider.model)}</strong></div><dl class="provider-facts"><dt>Base URL</dt><dd>${escapeHTML(provider.base_url)}</dd><dt>使用此配置</dt><dd>${profiles.length ? profiles.map(p => link(p.name, 'agents', p.id)).join('、') : '尚未关联 Agent'}</dd></dl><div class="provider-card-actions">${button(icon('edit') + (provider.credentials_configured ? ' 编辑配置' : ' 配置 / 填写 Key'), 'edit-provider', provider.id, provider.credentials_configured ? 'secondary' : 'primary', !connected)}${button(icon('trash') + ' 删除', 'delete-provider', provider.id, 'ghost', !connected || !!profiles.length)}</div></article>`;
+    }).join('')}</div><p class="page-note">API Key 按配置独立保存在服务端内存中，不回显、不写入浏览器存储；控制服务重启后需要重新填写。被 Agent 使用的配置需先解除关联才能删除。</p>`;
+  }
   function renderHosts() {
     if (!data.hosts.length) return empty('尚未读取到运行主机', '本地主机由控制服务提供。也可以添加已配置 SSH 登录的远程主机。', button(icon('plus') + ' 添加 SSH 主机', 'new-host', '', 'primary'));
     const rows = data.hosts.map(host => `<tr>${cell('主机', `<strong>${escapeHTML(host.name)}</strong><div class="cell-sub">${host.kind === 'ssh' ? `${escapeHTML(host.ssh_target)} · SSH ${escapeHTML(host.port || 22)}` : '控制服务所在机器'}</div>`)}${cell('类型', badge(host.kind === 'ssh' ? '远程 SSH' : '本地', host.kind === 'ssh' ? 'blue' : ''))}${cell('运行环境', `<div class="mono cell-description">${escapeHTML(host.repo_path || '—')}</div><div class="cell-sub mono">Python: ${escapeHTML(host.python_path || '—')}</div><div class="cell-sub mono">工作区: ${escapeHTML(host.workspace_root || '—')}</div><div class="cell-sub mono">Comm: ${escapeHTML(host.comm_host || '自动选择')}</div>`)}${cell('最近检查', checkSummary(host.last_check))}${cell('操作', button(icon('refresh') + (busy.has(`host:${host.id}`) ? '检查中' : '检查连接'), 'check-host', host.id, 'secondary', isBusy(`host:${host.id}`)))}</tr>`).join('');
@@ -683,10 +695,11 @@
       topics: data.admin.topic ? '' : button(icon('plus') + ' 创建管理员 Topic', 'new-topic', '', 'secondary', !connected),
       trace: '',
       notices: ui.id ? '' : button(icon('send') + ' 新建通知', 'new-notice', '', 'primary', !connected),
+      models: button(icon('plus') + ' 添加模型配置', 'new-provider', '', 'primary', !connected),
       hosts: button(icon('plus') + ' 添加 SSH 主机', 'new-host', '', 'primary', !connected),
     };
     $('#page-actions').innerHTML = actions[ui.page];
-    $('#page-content').innerHTML = renderCleanupStatus() + ({ overview: renderOverview, agents: renderAgents, topics: renderTopics, trace: renderTrace, notices: renderNotices, hosts: renderHosts })[ui.page]();
+    $('#page-content').innerHTML = renderCleanupStatus() + ({ overview: renderOverview, agents: renderAgents, topics: renderTopics, trace: renderTrace, notices: renderNotices, hosts: renderHosts, models: renderProviders })[ui.page]();
     $('#main').classList.toggle('is-chat-page', ui.page === 'topics' && !!ui.id);
     const selectAll = $('#select-all-agents');
     if (selectAll) selectAll.indeterminate = ui.selectedAgents.size > 0 && ui.selectedAgents.size < data.profiles.filter(canStartProfile).length;
@@ -718,15 +731,44 @@
     const first = dialog.querySelector('input,textarea,select');
     if (first) first.focus();
   }
+  function openProvider(id = null) {
+    const provider = (data?.model_providers || []).find(item => item.id === id);
+    if (id && !provider) return toast('模型配置已不存在，请刷新。', true);
+    const body = field('供应商 / 配置名称', 'name', provider?.name || '', { required: true, full: true, placeholder: '例如：团队模型网关' })
+      + field('Base URL', 'base_url', provider?.base_url || '', { type: 'url', required: true, full: true, placeholder: 'https://your-provider.example/v1', hint: '填写 API 根地址（保留所需 /v1），不要填写 /chat/completions。更换地址后需重新填写 Key。' })
+      + field('模型名称', 'model', provider?.model || '', { required: true, full: true, placeholder: '填写供应商提供的完整模型 ID' })
+      + field('API Key', 'api_key', '', { type: 'password', full: true, autocomplete: 'new-password', placeholder: provider?.credentials_configured ? '已设置；留空保持原 Key' : '填写该配置的 API Key', hint: '仅保存在当前服务会话中。本地无鉴权服务可填写其要求的占位值。' })
+      + (provider?.credentials_configured ? checkbox('清除此配置当前保存的 API Key', 'clear_api_key', false) : '')
+      + `<details class="field full provider-advanced"><summary>兼容选项</summary>${field('请求参数', 'api_mode', provider?.api_mode || 'openai', { options: [{ value: 'openai', label: '标准 OpenAI 兼容参数' }, { value: 'deepseek', label: 'DeepSeek 扩展（thinking / user_id）' }], hint: '默认使用标准参数；只有支持这些扩展的接口才选择 DeepSeek 模式。' })}</details>`;
+    openForm('provider', provider ? '编辑模型配置' : '添加模型配置', body, '保存配置', id);
+  }
+  function openDeleteProvider(id) {
+    const provider = (data?.model_providers || []).find(item => item.id === id);
+    if (!provider) return;
+    if (data.profiles.some(p => p.provider_id === id)) return toast('请先为使用此配置的 Agent 选择其他模型配置。', true);
+    openForm('delete-provider', '删除模型配置', `<div class="field full"><p>删除 <strong>${escapeHTML(provider.name)}</strong> 及其会话凭据？</p></div>`, '确认删除', id);
+    $('#form-submit').className = 'button danger';
+  }
+  function syncProviderOptions() {
+    const selected = $('#form-provider_id');
+    const input = dialog.querySelector('input[name="thinking"]');
+    if (!selected || !input) return;
+    const deepseek = (data.model_providers || []).find(p => p.id === selected.value)?.api_mode === 'deepseek';
+    input.disabled = !deepseek;
+    if (!deepseek) input.checked = false;
+    $('#provider-thinking').classList.toggle('provider-option-disabled', !deepseek);
+  }
   function openProfile(id = null) {
     if (!data) return toast('请等待控制服务连接。', true);
     const p = data.profiles.find(profile => profile.id === id);
     if (p?.runtime?.cleanup_pending) return toast('这个 Agent 正在清理关联数据，请等待清理完成。', true);
     if (p && runningStates.has(p.runtime?.state)) return toast('请先停止 Agent，再编辑配置。', true);
+    if (!(data.model_providers || []).length) { toast('请先添加一个模型配置，再创建 Agent。'); return openProvider(); }
     const hosts = data.hosts.map(host => ({ value: host.id, label: `${host.name} · ${host.kind === 'ssh' ? 'SSH' : '本地'}` }));
     if (!hosts.length) return toast('没有可用的运行主机，请先检查控制服务配置。', true);
-    const body = field('Agent 名称', 'name', p?.name || '', { required: true, placeholder: '例如：Researcher' }) + field('运行主机', 'host_id', p?.host_id || hosts[0].value, { options: hosts, required: true, hint: p ? '更换运行主机不会迁移已有历史或记忆。' : '' }) + field('人设 Persona', 'persona', p?.persona || '', { full: true, textarea: true, required: true, placeholder: '角色、职责、工作风格和长期边界', hint: '人设作为 Agent 的持续行为配置，与本次启动任务分开。' }) + field('启动任务 Initial prompt', 'initial_prompt', p?.initial_prompt || '完成当前任务后等待 topic 消息。', { full: true, textarea: true, required: true, placeholder: '本次启动后先做什么，以及完成后的协作要求' }) + '<div class="field-group-title">模型与记忆</div>' + field('API Base URL', 'base_url', p?.base_url || 'https://api.deepseek.com', { type: 'url', required: true }) + field('模型名称', 'model', p?.model || 'deepseek-flash', { required: true }) + checkbox('启用长期记忆', 'enable_memory', p ? !!p.enable_memory : true) + checkbox('启用思考模式', 'thinking', !!p?.thinking);
+    const body = field('Agent 名称', 'name', p?.name || '', { required: true, placeholder: '例如：alice' }) + field('运行主机', 'host_id', p?.host_id || hosts[0].value, { options: hosts, required: true, hint: p ? '更换运行主机不会迁移已有历史或记忆。' : '' }) + field('人设 Persona', 'persona', p?.persona || '', { full: true, textarea: true, required: true, placeholder: '角色、职责、工作风格和长期边界', hint: '人设作为 Agent 的持续行为配置，与本次启动任务分开。' }) + field('启动任务 Initial prompt', 'initial_prompt', p?.initial_prompt || '完成当前任务后等待 topic 消息。', { full: true, textarea: true, required: true, placeholder: '本次启动后先做什么，以及完成后的协作要求' }) + '<div class="field-group-title">模型与记忆</div>' + field('模型配置', 'provider_id', p?.provider_id || data.model_providers[0].id, { full: true, required: true, options: data.model_providers.map(provider => ({ value: provider.id, label: `${provider.name} · ${provider.model}${provider.credentials_configured ? '' : ' · 待设置 Key'}` })), hint: '在“模型配置”页面统一维护供应商、地址和凭据。更换配置在下次启动时生效。' }) + checkbox('启用长期记忆', 'enable_memory', p ? !!p.enable_memory : true) + `<div class="field full" id="provider-thinking">${checkbox('启用 DeepSeek 思考模式', 'thinking', !!p?.thinking)}<small>标准兼容接口使用模型默认的思考策略。</small></div>`;
     openForm('profile', p ? `编辑 ${p.name}` : '创建 Agent', body, p ? '保存配置' : '创建 Agent', id);
+    syncProviderOptions();
   }
   function openDeleteProfile(id) {
     const profile = data?.profiles.find(item => item.id === id);
@@ -755,9 +797,7 @@
     const body = field('主机名称', 'name', '', { required: true, placeholder: '例如：GPU Worker' }) + field('SSH 目标', 'ssh_target', '', { required: true, placeholder: 'user@host 或 SSH 配置别名' }) + field('SSH 端口', 'port', '22', { type: 'number', required: true }) + field('Comm 地址（可选）', 'comm_host', '', { placeholder: '自动选择局域网网卡', hint: '默认自动选择远程主机的局域网网卡；多网卡时可指定可达 IPv4。' }) + field('远程仓库路径', 'repo_path', '', { full: true, required: true, placeholder: '/srv/agent-group', hint: '远程机器上已部署此仓库的绝对路径。' }) + field('远程 Python 路径', 'python_path', '', { full: true, required: true, placeholder: '/srv/agent-group/.venv/bin/python' }) + field('远程工作区根目录', 'workspace_root', '', { full: true, required: true, placeholder: '/srv/agent-workspaces' });
     openForm('host', '添加局域网 SSH 主机', body, '添加主机', null, '添加同一局域网内的机器，使用本机已有的 SSH 配置与密钥。SSH 检查成功不代表 Agent 已加入 Topic，加入状态在 Agent 详情中查看。');
   }
-  function openCredentials() {
-    openForm('credentials', data?.credentials_configured ? '更新 API 凭据' : '设置 API 凭据', field('API Key', 'api_key', '', { type: 'password', full: true, required: true, autocomplete: 'new-password', hint: '仅保留在控制服务进程内存中。页面不写入浏览器存储；服务重启后需重新设置。' }), '保存到当前服务会话');
-  }
+  function openCredentials() { location.hash = '#models'; }
   function openTopic() {
     if (data?.admin.topic) { location.hash = '#notices'; return toast('管理员 Topic 已存在，可直接邀请成员。'); }
     openForm('topic', '创建管理员 Topic', field('Topic 名称', 'name', 'admin-announcements', { full: true, required: true }) + field('用途说明', 'description', '管理员向受管 Agent 同步任务意图、协作要求与工作进展。', { full: true, textarea: true }), '创建管理员 Topic');
@@ -802,13 +842,24 @@
     let path, payload, method = 'POST', success;
     const kind = ui.formKind;
     if (kind === 'credentials') { path = '/api/credentials'; payload = { api_key: value('api_key') }; success = 'API 凭据已保存在控制服务会话中。'; }
+    if (kind === 'provider') {
+      path = `/api/model-providers${ui.editingId ? `/${encodeURIComponent(ui.editingId)}` : ''}`; method = ui.editingId ? 'PUT' : 'POST';
+      payload = { name: value('name'), base_url: value('base_url'), model: value('model'), api_mode: value('api_mode') || 'openai' };
+      if (value('api_key')) payload.api_key = value('api_key');
+      if (fields.has('clear_api_key')) payload.clear_api_key = true;
+      if (payload.api_key && payload.clear_api_key) return showFormError('更换 Key 和清除 Key 请选择一项。');
+      success = '模型配置已保存，将用于 Agent 下次启动。';
+      const previous = (data.model_providers || []).find(provider => provider.id === ui.editingId);
+      if (previous?.credentials_configured && previous.base_url.replace(/\/+$/, '') !== payload.base_url.replace(/\/+$/, '') && !payload.api_key) success = '接口地址已更新，原 API Key 已清除；请为新地址填写 Key。';
+    }
+    if (kind === 'delete-provider') { path = `/api/model-providers/${encodeURIComponent(ui.editingId)}`; method = 'DELETE'; payload = {}; success = '模型配置已删除。'; }
     if (kind === 'host') {
       const port = Number(value('port'));
       if (!Number.isInteger(port) || port < 1 || port > 65535) return showFormError('SSH 端口必须是 1–65535 的整数。');
       for (const name of ['repo_path', 'python_path', 'workspace_root']) if (!value(name).startsWith('/')) return showFormError('远程仓库、Python 和工作区都需要填写绝对路径。');
       path = '/api/hosts'; payload = { name: value('name'), kind: 'ssh', ssh_target: value('ssh_target'), port, repo_path: value('repo_path'), python_path: value('python_path'), workspace_root: value('workspace_root'), comm_host: value('comm_host') }; success = 'SSH 主机已添加，可继续检查连接。';
     }
-    if (kind === 'profile') { path = `/api/profiles${ui.editingId ? `/${encodeURIComponent(ui.editingId)}` : ''}`; method = ui.editingId ? 'PUT' : 'POST'; payload = { name: value('name'), persona: value('persona'), initial_prompt: value('initial_prompt'), base_url: value('base_url'), model: value('model'), host_id: value('host_id'), enable_memory: fields.has('enable_memory'), thinking: fields.has('thinking') }; success = ui.editingId ? 'Agent 配置已保存。' : 'Agent 配置已创建。'; }
+    if (kind === 'profile') { path = `/api/profiles${ui.editingId ? `/${encodeURIComponent(ui.editingId)}` : ''}`; method = ui.editingId ? 'PUT' : 'POST'; payload = { name: value('name'), persona: value('persona'), initial_prompt: value('initial_prompt'), provider_id: value('provider_id'), host_id: value('host_id'), enable_memory: fields.has('enable_memory'), thinking: fields.has('thinking') }; success = ui.editingId ? 'Agent 配置已保存。' : 'Agent 配置已创建。'; }
     if (kind === 'delete-profile') { path = `/api/profiles/${encodeURIComponent(ui.editingId)}`; method = 'DELETE'; payload = {}; success = 'Agent 及其关联数据已删除。'; }
     if (kind === 'delete-topic') { path = `/api/topics/${encodeURIComponent(ui.editingId)}`; method = 'DELETE'; payload = {}; success = '话题及其关联记录已删除。'; }
     if (kind === 'topic') { path = '/api/admin/topic'; payload = { name: value('name'), description: value('description') }; success = '管理员 Topic 已创建。'; }
@@ -822,8 +873,9 @@
     submit.textContent = '处理中…';
     try {
       const result = await mutate(path, payload, method, 'form');
-      if (kind === 'credentials') { form.querySelector('[name="api_key"]').value = ''; payload.api_key = ''; }
+      if (kind === 'credentials' || kind === 'provider') { form.querySelector('[name="api_key"]').value = ''; payload.api_key = ''; }
       closeDialog();
+      if (kind === 'provider' || kind === 'delete-provider') location.hash = '#models';
       if (kind === 'host') location.hash = '#hosts';
       if (kind === 'profile' && method === 'POST') location.hash = '#agents';
       if (kind === 'delete-profile') { if (ui.traceProfile === result?.deleted) ui.traceProfile = ''; location.hash = '#agents'; }
@@ -858,6 +910,9 @@
     if (action === 'toggle-chat-members') { ui.chatMembers = !ui.chatMembers; renderPage(); return; }
     if (action === 'chat-latest') { const stream = $('#chat-stream'); if (stream) stream.scrollTop = stream.scrollHeight; updateChatJump(); return; }
     if (action === 'credentials') return openCredentials();
+    if (action === 'new-provider') return openProvider();
+    if (action === 'edit-provider') return openProvider(id);
+    if (action === 'delete-provider') return openDeleteProvider(id);
     if (action === 'close-dialog') return closeDialog();
     if (action === 'refresh') return loadState(true);
     if (action === 'new-profile') return openProfile();
@@ -873,7 +928,7 @@
     if (action === 'view-topic') { location.hash = `#topics/${encodeURIComponent(id)}`; return; }
     if (action === 'trace-agent') { ui.traceProfile = id; location.hash = '#trace'; renderPage(); return; }
     try {
-      if (action === 'start-profile') { await mutate(`/api/profiles/${encodeURIComponent(id)}/start`, {}, 'POST', `profile:${id}`); toast('启动请求已提交，状态会自动更新。'); }
+      if (action === 'start-profile') { const profile = data.profiles.find(p => p.id === id); if (!modelReady(profile)) { toast('请先为该 Agent 的模型配置填写 API Key。'); return profile?.provider_id ? openProvider(profile.provider_id) : openCredentials(); } await mutate(`/api/profiles/${encodeURIComponent(id)}/start`, {}, 'POST', `profile:${id}`); toast('启动请求已提交，状态会自动更新。'); }
       if (action === 'stop-profile') { await mutate(`/api/profiles/${encodeURIComponent(id)}/stop`, {}, 'POST', `profile:${id}`); toast('停止请求已提交。'); }
       if (action === 'check-host') { const result = await mutate(`/api/hosts/${encodeURIComponent(id)}/check`, {}, 'POST', `host:${id}`); const check = result?.last_check || result; toast(check?.message || check?.error || (check?.ok === false || check?.success === false ? '主机检查未通过，请查看检查结果。' : '主机检查已完成。'), check?.ok === false || check?.success === false); }
       if (action === 'invite-all') { await mutate('/api/admin/invite', {}, 'POST', 'invite-all'); toast('已请求邀请所有运行中的受管 Agent。'); }
@@ -901,6 +956,7 @@
   });
   document.addEventListener('scroll', event => { if (event.target.id === 'chat-stream') updateChatJump(); }, true);
   document.addEventListener('change', event => {
+    if (event.target.id === 'form-provider_id') syncProviderOptions();
     if (event.target.id === 'trace-agent-filter') { ui.traceProfile = event.target.value; renderPage(); $('#trace-agent-filter')?.focus(); }
     if ((event.target.id === 'select-all-agents' || event.target.dataset.agentSelect) && !ui.batch?.running && connected) {
       if (event.target.id === 'select-all-agents') ui.selectedAgents = new Set(event.target.checked ? data.profiles.filter(canStartProfile).map(p => p.id) : []);

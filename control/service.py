@@ -68,6 +68,9 @@ class ControlService:
             self.lease.close()
             raise ControlError("This data directory is already managed by another control server", 409) from None
         self.api_key = ""
+        self.provider_keys = {}
+        self.session_secrets = set()
+        self._legacy_key_pending = ""
         self.csrf_token = secrets.token_urlsafe(32)
         self.admin_secret = secrets.token_urlsafe(48)
         self.processes = {}
@@ -79,7 +82,7 @@ class ControlService:
         self.last_delete_attempt = {}
         self.last_cleanup_attempt = {}
         self.data = {"version": 1, "profiles": [], "hosts": [], "notices": [], "admin_topic": None,
-                     "deleted_topics": [], "deleted_profile_ids": [], "cleanup_jobs": []}
+                     "deleted_topics": [], "deleted_profile_ids": [], "cleanup_jobs": [], "model_providers": []}
         try:
             if self.path.exists():
                 loaded = json.loads(self.path.read_text())
@@ -93,6 +96,7 @@ class ControlService:
                     raise ControlError("Agent profiles must have distinct user_id values")
                 identities.add(user_id)
                 profile["user_id"] = user_id
+            self._migrate_model_providers()
         except BaseException:
             self.lease.close()
             raise
@@ -117,7 +121,7 @@ class ControlService:
             recovered, self.history_recovery = recover_truncated_sends(
                 self.history.truncated_sent_events(), self.root / "workspaces")
             for event in recovered:
-                self.history.append_event(redact(event, (self.api_key, self.admin_secret)))
+                self.history.append_event(redact(event, self._secret_values()))
             if self.data["admin_topic"]:
                 info = self.data["admin_topic"]
                 topic_id = self.comm.create_topic(info["name"], info["description"])
@@ -166,10 +170,128 @@ class ControlService:
             raise ControlError("Host not found", 404)
         return found
 
+    def _secret_values(self):
+        return (*self.session_secrets, self.api_key, self.admin_secret)
+
+    @staticmethod
+    def _validate_provider(data, identifier):
+        base_url = required_text(data, "base_url", limit=2048).rstrip("/")
+        try:
+            url = urlsplit(base_url)
+            url.port  # Validate malformed or out-of-range explicit ports too.
+        except ValueError:
+            raise ControlError("base_url must be a valid HTTP(S) URL") from None
+        if (url.scheme not in ("http", "https") or not url.hostname or url.username or url.password
+                or url.query or url.fragment or any(c.isspace() for c in base_url)):
+            raise ControlError("base_url must be an HTTP(S) URL without credentials, query or fragment")
+        mode = data.get("api_mode", "openai")
+        if mode not in ("openai", "deepseek"):
+            raise ControlError("api_mode must be openai or deepseek")
+        return {"id": identifier, "name": required_text(data, "name", limit=100),
+                "base_url": base_url, "model": required_text(data, "model", limit=150), "api_mode": mode}
+
+    def _provider(self, identifier):
+        provider = next((p for p in self.data["model_providers"] if p["id"] == identifier), None)
+        if provider is None:
+            raise ControlError("Model provider not found", 404)
+        return provider
+
+    def _public_provider(self, provider):
+        return {**provider, "credentials_configured": bool(self.provider_keys.get(provider["id"]))}
+
+    def _resolved_profile(self, profile):
+        provider = next((p for p in self.data["model_providers"] if p["id"] == profile.get("provider_id")), None)
+        return {**profile, "provider_name": provider["name"] if provider else "",
+                "base_url": provider["base_url"] if provider else "", "model": provider["model"] if provider else "",
+                "api_mode": provider["api_mode"] if provider else "openai", "model_configured": provider is not None,
+                "credentials_configured": bool(provider and self.provider_keys.get(provider["id"]))}
+
+    def _legacy_provider(self, profile):
+        base_url = required_text(profile, "base_url", "https://api.deepseek.com", limit=2048).rstrip("/")
+        mode = profile.get("api_mode") or ("deepseek" if urlsplit(base_url).hostname == "api.deepseek.com" else "openai")
+        model = required_text(profile, "model", "deepseek-flash", limit=150)
+        value = self._validate_provider({"name": "DeepSeek" if mode == "deepseek" else "OpenAI 兼容接口",
+                                         "base_url": base_url, "model": model, "api_mode": mode}, uuid4().hex)
+        existing = next((p for p in self.data["model_providers"] if all(
+            p[key] == value[key] for key in ("base_url", "model", "api_mode"))), None)
+        if existing:
+            return existing
+        self.data["model_providers"].append(value)
+        return value
+
+    def _migrate_model_providers(self):
+        # Old profiles carried their own endpoint/model. Preserve that pairing;
+        # never infer one global key for several independently configured hosts.
+        self.data["model_providers"] = [self._validate_provider(p, p["id"]) for p in self.data["model_providers"]]
+        for profile in self.data["profiles"]:
+            if not profile.get("provider_id"):
+                profile["provider_id"] = self._legacy_provider(profile)["id"]
+            for field in ("base_url", "model", "api_mode", "api_key"):
+                profile.pop(field, None)
+
+    def save_model_provider(self, data, identifier=None):
+        with self.lock:
+            old = self._provider(identifier) if identifier else None
+            provider = self._validate_provider(data, identifier or uuid4().hex)
+            if "clear_api_key" in data and type(data["clear_api_key"]) is not bool:
+                raise ControlError("clear_api_key must be a boolean")
+            key = data.get("api_key", "")
+            if not isinstance(key, str) or len(key) > 4096:
+                raise ControlError("api_key must be text (maximum 4096 characters)")
+            key = key.strip()
+            if key and data.get("clear_api_key"):
+                raise ControlError("Cannot replace and clear api_key in the same request")
+            previous = self.data["model_providers"]
+            self.data["model_providers"] = ([provider if p["id"] == identifier else p for p in previous]
+                                            if old else [*previous, provider])
+            try:
+                self._save()
+            except BaseException:
+                self.data["model_providers"] = previous
+                raise
+            self._legacy_key_pending = ""
+            # Changing the destination must not silently forward an old secret.
+            if data.get("clear_api_key") or (old and old["base_url"] != provider["base_url"]):
+                self.provider_keys.pop(provider["id"], None)
+            if key:
+                self.provider_keys[provider["id"]] = key
+                self.session_secrets.add(key)
+            return self._public_provider(provider)
+
+    def delete_model_provider(self, identifier):
+        with self.lock:
+            self._provider(identifier)
+            if any(p.get("provider_id") == identifier for p in self.data["profiles"]):
+                raise ControlError("Model provider is used by agents; change their model configuration first", 409)
+            previous = self.data["model_providers"]
+            self.data["model_providers"] = [p for p in previous if p["id"] != identifier]
+            try:
+                self._save()
+            except BaseException:
+                self.data["model_providers"] = previous
+                raise
+            self.provider_keys.pop(identifier, None)
+            return {"deleted": identifier}
+
     def set_credentials(self, data):
         key = required_text(data, "api_key", limit=4096)
         with self.lock:
+            provider_id = data.get("provider_id")
+            if provider_id:
+                self._provider(provider_id)
+            elif len(self.data["model_providers"]) == 1:
+                provider_id = self.data["model_providers"][0]["id"]
+            elif self.data["model_providers"]:
+                raise ControlError("Select provider_id when configuring credentials for multiple providers")
+            if provider_id:
+                self.provider_keys[provider_id] = key
+                self._legacy_key_pending = ""
+            else:
+                # Compatibility for old clients setting a key before creating
+                # their first legacy profile. Explicit providers never inherit it.
+                self._legacy_key_pending = key
             self.api_key = key
+            self.session_secrets.add(key)
         return {"credentials_configured": True}
 
     def save_profile(self, data, identifier=None):
@@ -190,10 +312,6 @@ class ControlService:
                 raise ControlError("Agent name already exists", 409)
             persona = required_text(data, "persona", limit=16000)
             initial = required_text(data, "initial_prompt", "完成当前任务后等待 topic 消息。", limit=16000)
-            base_url = required_text(data, "base_url", "https://api.deepseek.com", limit=2048)
-            url = urlsplit(base_url)
-            if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
-                raise ControlError("base_url must be an HTTP(S) URL without embedded credentials")
             host_id = required_text(data, "host_id", "local")
             self._host(host_id)
             for key in ("enable_memory", "thinking"):
@@ -204,9 +322,23 @@ class ControlService:
             user_id = previous.get("user_id", profile_user_id(profile_id)) if previous else profile_user_id(profile_id)
             if "user_id" in data and data["user_id"] != user_id:
                 raise ControlError("user_id is generated by the platform and cannot be changed")
+            previous_data = deepcopy(self.data)
+            legacy = False
+            if data.get("provider_id"):
+                provider = self._provider(data["provider_id"])
+            elif "base_url" in data or "model" in data:
+                required_text(data, "base_url", limit=2048)
+                required_text(data, "model", limit=150)
+                provider = self._legacy_provider(data)
+                legacy = True
+            elif previous and previous.get("provider_id"):
+                provider = self._provider(previous["provider_id"])
+            elif len(self.data["model_providers"]) == 1:
+                provider = self.data["model_providers"][0]
+            else:
+                raise ControlError("Select a model provider before creating an agent")
             profile = {"id": profile_id, "user_id": user_id, "name": name, "persona": persona,
-                       "initial_prompt": initial, "base_url": base_url,
-                       "model": required_text(data, "model", "deepseek-flash", limit=150),
+                       "initial_prompt": initial, "provider_id": provider["id"],
                        "host_id": host_id, "enable_memory": data.get("enable_memory", False),
                        "thinking": data.get("thinking", False)}
             if identifier:
@@ -214,8 +346,17 @@ class ControlService:
             else:
                 self.data["profiles"].append(profile)
                 self.runtime[profile["id"]] = self._empty_runtime()
-            self._save()
-            return deepcopy(profile)
+            try:
+                self._save()
+            except BaseException:
+                self.data = previous_data
+                if not identifier:
+                    self.runtime.pop(profile_id, None)
+                raise
+            if legacy and self._legacy_key_pending:
+                self.provider_keys[provider["id"]] = self._legacy_key_pending
+                self._legacy_key_pending = ""
+            return self._resolved_profile(profile)
 
     def delete_profile(self, identifier):
         # poll() can report exit while the reader still owns its log and waits
@@ -312,7 +453,7 @@ class ControlService:
         except Exception as exc:
             self.data = previous
             pending = self._cleanup_job(kind, identifier)
-            pending["error"] = str(redact(str(exc), (self.api_key, self.admin_secret)))
+            pending["error"] = str(redact(str(exc), self._secret_values()))
             pending["last_attempt_at"] = timestamp()
             try:
                 self._save()
@@ -400,15 +541,18 @@ class ControlService:
             existing = self.processes.get(identifier)
             if existing and existing["process"].poll() is None:
                 raise ControlError("Agent is already running or stopping", 409)
-            if not self.api_key:
-                raise ControlError("Set the session API key before starting agents", 409)
+            provider = self._provider(profile["provider_id"])
+            api_key = self.provider_keys.get(provider["id"])
+            if not api_key:
+                raise ControlError(f"Set the session API key for model provider {provider['name']} before starting agents", 409)
             host = deepcopy(self._host(profile["host_id"]))
             run_id = uuid4().hex
             workdir = (str(self.root / "workspaces" / identifier) if host["kind"] == "local"
                        else str(PurePosixPath(host["workspace_root"]) / identifier))
-            config = {key: profile[key] for key in ("name", "persona", "initial_prompt", "model",
-                                                     "base_url", "thinking", "enable_memory", "user_id")}
-            config.update(api_key=self.api_key, profile_id=identifier, workdir=workdir,
+            config = {key: profile[key] for key in ("name", "persona", "initial_prompt",
+                                                     "thinking", "enable_memory", "user_id")}
+            config.update({key: provider[key] for key in ("base_url", "model", "api_mode")})
+            config.update(api_key=api_key, profile_id=identifier, workdir=workdir,
                           host=self.comm_host if host["kind"] == "local" else host.get("comm_host"),
                           seeds=[self.comm.endpoint],
                           deleted_topic_ids=[t["topic_id"] for t in self.data["deleted_topics"]])
@@ -476,7 +620,7 @@ class ControlService:
             return
         # Protocol fields containing credentials are never retained or returned.
         event = {k: v for k, v in event.items() if k not in ("api_key", "secret", "signature", "reasoning_content")}
-        event = redact(event, (self.api_key, self.admin_secret))
+        event = redact(event, self._secret_values())
         if "name" in event:
             event["tool_name" if event.get("type", "").startswith("tool_") else "topic_name"] = event["name"]
         event.update(id=uuid4().hex, ts=timestamp(), profile_id=profile_id, run_id=run_id,
@@ -494,7 +638,7 @@ class ControlService:
             runtime = self.runtime.get(identifier)
             if not runtime or runtime["run_id"] != run_id or not isinstance(event, dict):
                 return
-            event = redact(event, (self.api_key, self.admin_secret))
+            event = redact(event, self._secret_values())
             kind = event.get("type")
             if not isinstance(kind, str):
                 return
@@ -798,7 +942,7 @@ class ControlService:
 
     def snapshot(self):
         with self.lock:
-            profiles = [{**p, "runtime": deepcopy(self.runtime[p["id"]])} for p in self.data["profiles"]]
+            profiles = [{**self._resolved_profile(p), "runtime": deepcopy(self.runtime[p["id"]])} for p in self.data["profiles"]]
             for profile in profiles:
                 if job := self._cleanup_job("profile", profile["id"]):
                     profile["runtime"].update(cleanup_pending=True, cleanup_error=job.get("error"))
@@ -825,7 +969,8 @@ class ControlService:
                                         (topic["is_admin"] and p["runtime"]["admin_joined"])]
                 if topic.get("last_message"):
                     topic["last_message"]["content"] = topic["last_message"]["content"][:200]
-            return {"csrf_token": self.csrf_token, "credentials_configured": bool(self.api_key),
+            return {"csrf_token": self.csrf_token, "credentials_configured": bool(self.provider_keys or self._legacy_key_pending),
+                    "model_providers": [self._public_provider(p) for p in self.data["model_providers"]],
                     "admin": {"agent_id": self.comm.agent_id, "endpoint": self.comm.endpoint, "topic": deepcopy(self.topic)},
                     "hosts": deepcopy(self.data["hosts"]), "profiles": profiles, "topics": list(topics.values()),
                     "history_recovery": deepcopy(self.history_recovery),
@@ -863,3 +1008,6 @@ class ControlService:
         self.history.close()
         self.lease.close()
         self.api_key = ""
+        self.provider_keys.clear()
+        self.session_secrets.clear()
+        self._legacy_key_pending = ""

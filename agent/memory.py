@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from .identity import resolve_user_id, validate_user_id
+from .model_config import completion_options, resolve_api_mode
 
 
 logger = logging.getLogger(__name__)
@@ -143,17 +144,18 @@ def keyword_memory_selection(records: list[dict], query: str, max_items: int) ->
 class MemoryStore:
     """Owns one workspace's memory. The caller owns the supplied SDK client.
 
-    Auxiliary recall/extraction calls always disable thinking, independently of
-    the main agent's model settings.
+    DeepSeek auxiliary calls disable thinking independently of the main agent;
+    generic providers receive only standard Chat Completions fields.
     """
 
     def __init__(self, workdir: Path, client, model: str, *, thinking: bool = False,
-                 user_id: str | None = None):
+                 user_id: str | None = None, api_mode: str | None = None):
         self.workdir = Path(workdir).resolve()
         self.directory = self.workdir / ".memory"
         self.index_name = "MEMORY.md"
         self.client = client
         self.model = model
+        self.api_mode = resolve_api_mode(api_mode, getattr(client, "base_url", None))
         self._user_id = validate_user_id(user_id) if user_id is not None else None
 
     @property
@@ -225,7 +227,7 @@ class MemoryStore:
         response = self.client.chat.completions.create(
             model=self.model, messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens, stream=False,
-            extra_body={"thinking": {"type": "disabled"}, "user_id": self.user_id},
+            **completion_options(self.api_mode, self.user_id),
         )
         return response.choices[0].message.content or ""
 

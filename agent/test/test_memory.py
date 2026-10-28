@@ -41,7 +41,7 @@ class MemoryStoreTests(unittest.TestCase):
         self.root = Path(temporary.name)
 
     def store(self, client=None, name="node"):
-        return MemoryStore(self.root / name, client or FakeClient(), "deepseek-flash")
+        return MemoryStore(self.root / name, client or FakeClient(), "deepseek-flash", api_mode="deepseek")
 
     def test_constructor_has_no_filesystem_or_model_side_effects(self):
         client = FakeClient()

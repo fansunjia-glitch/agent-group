@@ -109,7 +109,11 @@ def make_server(service, port=8765):
                 if not isinstance(data, dict):
                     raise ControlError("JSON body must be an object")
                 parts = urlsplit(self.path).path.strip("/").split("/")
-                if self.command == "PUT" and len(parts) == 3 and parts[:2] == ["api", "profiles"]:
+                if self.command == "PUT" and len(parts) == 3 and parts[:2] == ["api", "model-providers"]:
+                    result = service.save_model_provider(data, parts[2])
+                elif self.command == "DELETE" and len(parts) == 3 and parts[:2] == ["api", "model-providers"]:
+                    result = service.delete_model_provider(parts[2])
+                elif self.command == "PUT" and len(parts) == 3 and parts[:2] == ["api", "profiles"]:
                     result = service.save_profile(data, parts[2])
                 elif self.command == "DELETE" and len(parts) == 3 and parts[:2] == ["api", "profiles"]:
                     result = service.delete_profile(parts[2])
@@ -119,6 +123,8 @@ def make_server(service, port=8765):
                     result = service.delete_notice(parts[2])
                 elif self.command != "POST":
                     raise ControlError("Not found", 404)
+                elif parts == ["api", "model-providers"]:
+                    result = service.save_model_provider(data)
                 elif parts == ["api", "credentials"]:
                     result = service.set_credentials(data)
                 elif parts == ["api", "hosts"]:

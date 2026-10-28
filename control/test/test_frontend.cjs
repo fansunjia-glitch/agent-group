@@ -17,10 +17,12 @@ function profile(id, state = 'stopped', pid = null) {
 function harness(profiles, { credentials = true, request = async () => ({ state: 'starting', pid: 100 }) } = {}) {
   const listeners = new Map();
   const observations = { requests: [], credentialsOpened: 0, refreshes: [], toasts: [], renders: 0, forms: [] };
-  const dialog = { addEventListener() {} };
+  const controls = new Map();
+  const dialog = { addEventListener() {}, querySelector: selector => controls.get(selector) || null,
+    close() { this.open = false; }, replaceChildren() {} };
   const context = vm.createContext({
     document: {
-      querySelector: () => dialog,
+      querySelector: selector => controls.get(selector) || dialog,
       addEventListener: (name, listener) => {
         const callbacks = listeners.get(name) || [];
         callbacks.push(listener); listeners.set(name, callbacks);
@@ -29,6 +31,11 @@ function harness(profiles, { credentials = true, request = async () => ({ state:
     window: { addEventListener() {} },
     location: { hash: '#agents' },
     URLSearchParams,
+    FormData: class {
+      constructor(form) { this.fields = form.fields; }
+      get(name) { return this.fields.get(name); }
+      has(name) { return this.fields.has(name); }
+    },
   });
   vm.runInContext(source.slice(0, bootstrap) + `
     globalThis.consoleTest = {
@@ -62,6 +69,9 @@ function harness(profiles, { credentials = true, request = async () => ({ state:
       topicDetail: renderTopicDetail,
       groupTrace: groupTraceEvents,
       traceSpan: renderTraceSpan,
+      providerFor, modelReady, renderProviders, openProvider, openDeleteProvider,
+      syncProviderOptions,
+      submit: submitForm,
     };
   })();`, context, { filename: 'control/static/app.js' });
   const app = context.consoleTest;
@@ -77,7 +87,7 @@ function harness(profiles, { credentials = true, request = async () => ({ state:
     form: (...args) => observations.forms.push(args),
   });
   return {
-    app, observations,
+    app, observations, controls,
     select: (...ids) => ids.forEach(id => app.ui.selectedAgents.add(id)),
     change: target => listeners.get('change').forEach(callback => callback({ target })),
   };
@@ -759,4 +769,191 @@ test('notice deletion opens a safe explicit confirmation without performing a de
   await app.action('delete-notice', 'absent');
   assert.equal(observations.forms.length, 1);
   assert.equal(observations.requests.length, 0);
+});
+
+function provider(id, credentials_configured = true, extra = {}) {
+  return { id, name: `Vendor ${id}`, base_url: `https://${id}.example/v1`, model: `model-${id}`,
+    api_mode: 'openai', credentials_configured, ...extra };
+}
+
+function formEvent(h, kind, fields, id = null) {
+  const keyInput = { value: fields.api_key || '' };
+  const buttons = [{ disabled: false }];
+  const form = { fields: new Map(Object.entries(fields)), reportValidity: () => true,
+    querySelectorAll: () => buttons, querySelector: selector => selector === '[name="api_key"]' ? keyInput : null };
+  h.app.ui.formKind = kind;
+  h.app.ui.editingId = id;
+  h.controls.set('input[name="api_key"]', keyInput);
+  h.controls.set('#form-error', { hidden: true, textContent: '' });
+  h.controls.set('#form-submit', { textContent: 'Save' });
+  return { event: { preventDefault() {}, target: form }, keyInput, buttons };
+}
+
+test('provider credentials are resolved per agent and cannot borrow a global or another provider key', () => {
+  const records = [{ ...profile('a'), provider_id: 'one' }, { ...profile('b'), provider_id: 'two' },
+    { ...profile('c'), provider_id: 'missing' }];
+  const { app } = harness(records, { credentials: false });
+  app.data.model_providers = [provider('one'), provider('two', false)];
+  assert.equal(app.modelReady(records[0]), true, 'A configured provider does not depend on the legacy global key');
+  app.data.credentials_configured = true;
+  assert.equal(app.modelReady(records[1]), false, 'Another configured provider must not make this one ready');
+  assert.equal(app.modelReady(records[2]), false);
+  assert.equal(app.modelReady(undefined), false);
+  app.data.model_providers = [];
+  assert.equal(app.modelReady(records[0]), false, 'An explicitly empty provider list must not use the legacy fallback');
+});
+
+test('batch starts ready providers while retaining missing-key members for retry', async () => {
+  const records = [{ ...profile('a'), provider_id: 'one' }, { ...profile('b'), provider_id: 'two' },
+    { ...profile('c'), provider_id: 'three' }];
+  const h = harness(records, { credentials: false });
+  h.app.data.model_providers = [provider('one'), provider('two', false), provider('three')];
+  h.select('a', 'b', 'c');
+  await h.app.start();
+  assert.deepEqual(h.observations.requests.map(r => r.url), ['/api/profiles/a/start', '/api/profiles/c/start']);
+  assert.deepEqual(Array.from(h.app.ui.batch.items, i => [i.id, i.status]), [['a', 'submitted'], ['b', 'error'], ['c', 'submitted']]);
+  assert.match(h.app.ui.batch.items[1].error, /API Key/);
+  assert.deepEqual(selected(h.app), ['b']);
+  assert.equal(h.observations.credentialsOpened, 0);
+  assert.equal(h.app.busy.size, 0);
+});
+
+test('all missing provider keys preserve selection and individual start opens the correct blank-key form', async () => {
+  const records = [{ ...profile('a'), provider_id: 'one' }, { ...profile('b'), provider_id: 'two' }];
+  const h = harness(records, { credentials: true });
+  h.app.data.model_providers = [provider('one', false), provider('two', false)];
+  h.select('a', 'b');
+  await h.app.start();
+  assert.equal(h.observations.credentialsOpened, 1);
+  assert.equal(h.app.ui.batch, null);
+  assert.deepEqual(selected(h.app), ['a', 'b']);
+  await h.app.action('start-profile', 'b');
+  assert.equal(h.observations.requests.length, 0);
+  assert.equal(h.observations.forms.at(-1)[0], 'provider');
+  assert.equal(h.observations.forms.at(-1)[4], 'two');
+  assert.match(h.observations.forms.at(-1)[2], /name="api_key"[^>]*value=""/);
+});
+
+test('queued batch items recheck provider readiness before submitting', async () => {
+  const deferred = deferredRequests();
+  const records = 'abcd'.split('').map(id => ({ ...profile(id), provider_id: id === 'd' ? 'two' : 'one' }));
+  const h = harness(records, { request: deferred.request });
+  h.app.data.model_providers = [provider('one'), provider('two')];
+  h.select('a', 'b', 'c', 'd');
+  const completion = h.app.start();
+  assert.equal(deferred.calls.length, 3);
+  h.app.data.model_providers[1].credentials_configured = false;
+  deferred.calls[0].resolve();
+  await flush();
+  assert.equal(deferred.calls.length, 3, 'A key removed while queued must prevent submission');
+  deferred.calls.slice(1).forEach(c => c.resolve());
+  await completion;
+  assert.equal(h.app.ui.batch.items[3].status, 'error');
+  assert.deepEqual(selected(h.app), ['d']);
+});
+
+test('provider rendering escapes untrusted fields, shows only key status, and guards referenced deletion', async () => {
+  const h = harness([{ ...profile('a'), name: '<alice>', provider_id: 'one' }]);
+  h.app.data.model_providers = [provider('one', true, { name: '<img src=x>', model: '<model>', api_key: 'never-render-this-key' }), provider('two', false)];
+  const html = h.app.renderProviders();
+  assert.match(html, /&lt;img src=x&gt;/);
+  assert.match(html, /&lt;model&gt;/);
+  assert.match(html, /&lt;alice&gt;/);
+  assert.doesNotMatch(html, /never-render-this-key|<img src=x>|<model>|<alice>/);
+  assert.match(html, /Key 已设置/);
+  assert.match(html, /待设置 Key/);
+  assert.match(html, /data-action="delete-provider" data-id="one" disabled/);
+  assert.doesNotMatch(html, /data-action="delete-provider" data-id="two" disabled/);
+  await h.app.action('delete-provider', 'one');
+  assert.equal(h.observations.forms.length, 0);
+  assert.equal(h.observations.requests.length, 0);
+  await h.app.action('delete-provider', 'two');
+  assert.equal(h.observations.forms.at(-1)[0], 'delete-provider');
+});
+
+test('provider and agent editors use generic configuration without prefilled vendor credentials', async () => {
+  const h = harness([]);
+  h.app.data.model_providers = [];
+  await h.app.action('new-profile');
+  let form = h.observations.forms.at(-1);
+  assert.equal(form[0], 'provider', 'A new agent first needs a provider configuration');
+  assert.match(form[2], /name="base_url"[^>]*value=""/);
+  assert.match(form[2], /name="model"[^>]*value=""/);
+  assert.match(form[2], /value="openai" selected/);
+  assert.doesNotMatch(form[2], /value="deepseek-flash"|value="https:\/\/api\.deepseek\.com"/);
+  h.app.data.model_providers = [provider('one', true, { api_key: 'must-not-prefill' })];
+  h.app.openProvider('one');
+  form = h.observations.forms.at(-1);
+  assert.match(form[2], /留空保持原 Key/);
+  assert.match(form[2], /name="api_key"[^>]*value=""/);
+  assert.doesNotMatch(form[2], /must-not-prefill/);
+  h.app.data.hosts = [{ id: 'local', name: '本机', kind: 'local' }];
+  await h.app.action('new-profile');
+  form = h.observations.forms.at(-1);
+  assert.equal(form[0], 'profile');
+  assert.match(form[2], /name="provider_id"/);
+  assert.match(form[2], /Vendor one · model-one/);
+  assert.doesNotMatch(form[2], /name="base_url"|name="model"|name="api_key"/);
+});
+
+test('provider submission uses its own endpoint and clears the entered key after saving', async () => {
+  const h = harness([], { request: async () => ({ id: 'new-provider' }) });
+  const form = formEvent(h, 'provider', { name: 'My gateway', base_url: 'https://gateway.example/v1', model: 'custom-model', api_key: 'test-provider-secret' });
+  await h.app.submit(form.event);
+  assert.equal(h.observations.requests.length, 1);
+  const { url, options } = h.observations.requests[0];
+  assert.equal(url, '/api/model-providers');
+  assert.equal(options.method, 'POST');
+  assert.equal(options.headers['X-Control-Token'], 'test-csrf');
+  assert.deepEqual(JSON.parse(options.body), { name: 'My gateway', base_url: 'https://gateway.example/v1', model: 'custom-model', api_mode: 'openai', api_key: 'test-provider-secret' });
+  assert.equal(form.keyInput.value, '');
+  assert.equal(h.app.ui.formKind, null);
+  assert.ok(h.observations.toasts.every(t => !t.message.includes('test-provider-secret')));
+});
+
+test('blank provider key preserves it, explicit clearing is separate, and conflicting actions are rejected', async () => {
+  const fields = { name: 'Gateway', base_url: 'https://gateway.example/v1', model: 'custom-model', api_mode: 'openai', api_key: '' };
+  for (const clear of [false, true]) {
+    const h = harness([], { request: async () => ({ id: 'one' }) });
+    const form = formEvent(h, 'provider', { ...fields, ...(clear ? { clear_api_key: 'on' } : {}) }, 'one');
+    await h.app.submit(form.event);
+    const { url, options } = h.observations.requests[0];
+    assert.equal(url, '/api/model-providers/one');
+    assert.equal(options.method, 'PUT');
+    const payload = JSON.parse(options.body);
+    assert.equal(Object.hasOwn(payload, 'api_key'), false);
+    assert.equal(payload.clear_api_key, clear ? true : undefined);
+  }
+  const h = harness([]);
+  const form = formEvent(h, 'provider', { ...fields, api_key: 'test-secret', clear_api_key: 'on' }, 'one');
+  await h.app.submit(form.event);
+  assert.equal(h.observations.requests.length, 0);
+  assert.match(h.controls.get('#form-error').textContent, /请选择一项/);
+});
+
+test('agent submission references the selected provider without copying model settings or keys', async () => {
+  const h = harness([], { request: async () => ({ id: 'agent-one' }) });
+  const form = formEvent(h, 'profile', { name: 'alice', persona: 'Resident', initial_prompt: 'Say hello', host_id: 'local', provider_id: 'vendor-two', enable_memory: 'on' });
+  await h.app.submit(form.event);
+  const { url, options } = h.observations.requests[0];
+  assert.equal(url, '/api/profiles');
+  assert.deepEqual(JSON.parse(options.body), { name: 'alice', persona: 'Resident', initial_prompt: 'Say hello', host_id: 'local', provider_id: 'vendor-two', enable_memory: true, thinking: false });
+});
+
+test('switching from DeepSeek to generic clears and disables its private thinking option', () => {
+  const h = harness([]);
+  h.app.data.model_providers = [provider('generic'), provider('deep', true, { api_mode: 'deepseek' })];
+  const selectedProvider = { value: 'generic' }, thinking = { disabled: false, checked: true };
+  const classes = new Map();
+  h.controls.set('#form-provider_id', selectedProvider);
+  h.controls.set('input[name="thinking"]', thinking);
+  h.controls.set('#provider-thinking', { classList: { toggle: (name, on) => classes.set(name, on) } });
+  h.app.syncProviderOptions();
+  assert.equal(thinking.checked, false);
+  assert.equal(thinking.disabled, true);
+  assert.equal(classes.get('provider-option-disabled'), true);
+  selectedProvider.value = 'deep';
+  h.app.syncProviderOptions();
+  assert.equal(thinking.disabled, false);
+  assert.equal(thinking.checked, false, 'Switching back must not silently opt into thinking');
 });

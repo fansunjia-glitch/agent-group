@@ -22,6 +22,7 @@ from .file_tools import FileTools, TOOLS as FILE_TOOLS
 from .history import HistoryStore, build_context
 from .identity import resolve_user_id, validate_user_id
 from .memory import MemoryStore
+from .model_config import completion_messages, completion_options, resolve_api_mode
 from .topic_tools import TopicManager, TOOLS as TOPIC_TOOLS
 
 
@@ -56,6 +57,7 @@ class Agent:
         max_tokens: int = 8000,
         max_context_chars: int = 60000,
         thinking: bool = False,
+        api_mode: str | None = None,
         enable_memory: bool = True,
         idle_interval: float = 0.2,
         persona: str = "",
@@ -85,6 +87,7 @@ class Agent:
             raise ValueError("deleted_topic_ids must be a list of non-empty topic IDs")
         if event_sink is not None and not callable(event_sink):
             raise ValueError("event_sink must be callable")
+        self.api_mode = resolve_api_mode(api_mode, base_url)
         self.name = name if name is not None else f"agent-{uuid4().hex[:12]}"
         if not isinstance(self.name, str) or not self.name or self.name in (".", "..") or "/" in self.name or "\\" in self.name:
             raise ValueError("name must be a non-empty directory name")
@@ -145,7 +148,8 @@ class Agent:
             self.file_tools = FileTools(self.workdir)
             self.scheduler = CronScheduler(self.workdir)
             resources.callback(self.scheduler.close)
-            self.memory = MemoryStore(self.workdir, self.client, model, user_id=self.user_id) if enable_memory else None
+            self.memory = MemoryStore(self.workdir, self.client, model, user_id=self.user_id,
+                                      api_mode=self.api_mode) if enable_memory else None
             self.tools = [*FILE_TOOLS, *TOPIC_TOOLS, *self.scheduler.tools]
             self.handlers = {**self.file_tools.handlers, **self.topic_manager.handlers,
                              **self.scheduler.handlers}
@@ -411,7 +415,8 @@ class Agent:
         while not self._stop.is_set():
             self._collect_events()
             self.history.save(self.messages)
-            context = build_context(self.messages, system, self.tools, self.max_context_chars)
+            context = build_context(completion_messages(self.messages, self.api_mode),
+                                    system, self.tools, self.max_context_chars)
             response = self._stream_response(context)
             if response is None:
                 continue
@@ -468,7 +473,7 @@ class Agent:
     def _preserve_interrupted(self, text: str, incoming: list, reasoning: str = "") -> None:
         if text.strip():
             partial = {"role": "assistant", "content": text, "_interrupted": True}
-            if reasoning or self.thinking:
+            if self.api_mode == "deepseek" and (reasoning or self.thinking):
                 partial["reasoning_content"] = reasoning
             self.messages.append(partial)
         notice = "上一轮生成被新 topic 消息中断；已输出文本不代表任务完成，未完成的工具调用均未执行。\n\n"
@@ -502,10 +507,9 @@ class Agent:
         finish_reason = None
         try:
             with self.client.chat.completions.create(
-                model=self.model, messages=messages, tools=self.tools,
+                model=self.model, messages=completion_messages(messages, self.api_mode), tools=self.tools,
                 stream=True, max_tokens=self.max_tokens,
-                extra_body={"thinking": {"type": "enabled" if self.thinking else "disabled"},
-                            "user_id": self.user_id},
+                **completion_options(self.api_mode, self.user_id, thinking=self.thinking),
             ) as stream:
                 for chunk in stream:
                     if self._stop.is_set():
@@ -557,6 +561,6 @@ class Agent:
             raise RuntimeError("Model returned neither content nor tool calls")
         # DeepSeek requires reasoning_content to be replayed when thinking
         # mode and tools are used together. Never print it as user output.
-        if reasoning or self.thinking:
+        if self.api_mode == "deepseek" and (reasoning or self.thinking):
             response["reasoning_content"] = "".join(reasoning)
         return response

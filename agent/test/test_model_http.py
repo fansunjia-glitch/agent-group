@@ -8,8 +8,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
+from unittest.mock import patch
 
 from agent import Agent
+from agent.test.quiet_comm import QuietComm, local_model_network
 
 
 def chunk(delta, finish_reason=None):
@@ -64,6 +66,14 @@ def model_server(responses):
 
 
 class ModelHTTPTests(unittest.TestCase):
+    def setUp(self):
+        network = local_model_network()
+        network.start()
+        self.addCleanup(network.stop)
+        communication = patch("agent.agent.Comm", QuietComm)
+        communication.start()
+        self.addCleanup(communication.stop)
+
     def test_real_sdk_reassembles_tool_and_reasoning_deltas_and_replays_results(self):
         responses = [
             [
@@ -93,7 +103,7 @@ class ModelHTTPTests(unittest.TestCase):
                 output = StringIO()
                 with Agent(
                     api_key="test", base_url=base_url, host="127.0.0.1",
-                    enable_memory=False, thinking=True, workdir=directory,
+                    enable_memory=False, thinking=True, api_mode="deepseek", workdir=directory,
                     request_timeout=2.0,
                 ) as node:
                     node._append_user("Write hello 世界 to answer.txt")
@@ -137,7 +147,7 @@ class ModelHTTPTests(unittest.TestCase):
             with model_server(responses) as (base_url, requests):
                 with Agent(
                     api_key="test", base_url=base_url, host="127.0.0.1",
-                    enable_memory=False, thinking=False, workdir=directory,
+                    enable_memory=False, thinking=False, api_mode="deepseek", workdir=directory,
                     request_timeout=2.0,
                 ) as node:
                     node._append_user("Say Ready")
